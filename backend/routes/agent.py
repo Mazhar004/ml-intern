@@ -61,60 +61,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["agent"])
 _background_teardown_tasks: set[asyncio.Task] = set()
 
-AVAILABLE_MODELS = [
-    {
-        "id": "moonshotai/Kimi-K2.6",
-        "label": "Kimi K2.6",
-        "provider": "huggingface",
-        "tier": "free",
-        "recommended": True,
-    },
-    {
-        "id": "bedrock/us.anthropic.claude-opus-4-6-v1",
-        "label": "Claude Opus 4.6",
-        "provider": "anthropic",
-        "tier": "pro",
-        "recommended": True,
-    },
-    {
-        "id": "MiniMaxAI/MiniMax-M2.7",
-        "label": "MiniMax M2.7",
-        "provider": "huggingface",
-        "tier": "free",
-    },
-    {
-        "id": "zai-org/GLM-5.1",
-        "label": "GLM 5.1",
-        "provider": "huggingface",
-        "tier": "free",
-    },
-    {
-        "id": "openai/gpt-5.5",
-        "label": "GPT-5.5",
-        "provider": "openai",
-        "tier": "pro",
-    },
-    {
-        "id": "deepseek/deepseek-v4-pro",
-        "label": "DeepSeek V4 Pro",
-        "provider": "deepseek",
-        "tier": "pro",
-        "recommended": True,
-    },
-    {
-        "id": "deepseek/deepseek-v4-flash",
-        "label": "DeepSeek V4 Flash",
-        "provider": "deepseek",
-        "tier": "pro",
-    },
-    {
-        "id": "anthropic/claude-opus-4-6",
-        "label": "Claude Opus 4.6 (direct)",
-        "provider": "anthropic",
-        "tier": "pro",
-    },
-]
-
 DEFAULT_CLAUDE_MODEL_ID = "bedrock/us.anthropic.claude-opus-4-6-v1"
 DEFAULT_FREE_MODEL_ID = "moonshotai/Kimi-K2.6"
 PREMIUM_MODEL_IDS = {
@@ -124,19 +70,12 @@ PREMIUM_MODEL_IDS = {
 DATASET_UPLOAD_MULTIPART_SLACK_BYTES = 1024 * 1024
 
 
-def _claude_picker_model_id() -> str:
-    """Return the model ID used by the Claude option in the UI.
-
-    The frontend config sets ``session_manager.config.model_name`` from
-    ``ML_INTERN_CLAUDE_MODEL_ID`` when that env var is present, otherwise it
-    falls back to the production Bedrock Claude model. This function only
-    exposes that resolved config value for the Claude picker; non-Claude models
-    are listed separately in the model switcher.
-    """
-    return session_manager.config.model_name
-
-
 def _available_models() -> list[dict[str, Any]]:
+    # Curated dropdown for this fork: free HF-routed models plus premium
+    # direct-API options. DeepSeek uses the direct ``deepseek/`` provider
+    # (DEEPSEEK_API_KEY) to match agent/core/llm_params.py routing. The Claude
+    # entry is pinned to the Bedrock id rather than the config default, since
+    # this fork defaults to deepseek/deepseek-v4-pro.
     models = [
         {
             "id": "moonshotai/Kimi-K2.6",
@@ -146,17 +85,11 @@ def _available_models() -> list[dict[str, Any]]:
             "recommended": True,
         },
         {
-            "id": _claude_picker_model_id(),
+            "id": DEFAULT_CLAUDE_MODEL_ID,
             "label": "Claude Opus 4.6",
             "provider": "anthropic",
             "tier": "pro",
             "recommended": True,
-        },
-        {
-            "id": "openai/gpt-5.5",
-            "label": "GPT-5.5",
-            "provider": "openai",
-            "tier": "pro",
         },
         {
             "id": "MiniMaxAI/MiniMax-M2.7",
@@ -171,10 +104,29 @@ def _available_models() -> list[dict[str, Any]]:
             "tier": "free",
         },
         {
-            "id": "deepseek-ai/DeepSeek-V4-Pro:deepinfra",
+            "id": "openai/gpt-5.5",
+            "label": "GPT-5.5",
+            "provider": "openai",
+            "tier": "pro",
+        },
+        {
+            "id": "deepseek/deepseek-v4-pro",
             "label": "DeepSeek V4 Pro",
-            "provider": "huggingface",
-            "tier": "free",
+            "provider": "deepseek",
+            "tier": "pro",
+            "recommended": True,
+        },
+        {
+            "id": "deepseek/deepseek-v4-flash",
+            "label": "DeepSeek V4 Flash",
+            "provider": "deepseek",
+            "tier": "pro",
+        },
+        {
+            "id": "anthropic/claude-opus-4-6",
+            "label": "Claude Opus 4.6 (direct)",
+            "provider": "anthropic",
+            "tier": "pro",
         },
     ]
     return models
