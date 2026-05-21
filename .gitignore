@@ -64,11 +64,41 @@ skills/
 *.jsonl
 *.csv
 
-# ML / Data
-data/
-datasets/
-models/
+# User project workspaces (per-session bind-mount roots).
+# Each projects/<name>/ is its own self-contained research folder with
+# data/, code/, models/, notes/. Already pushed to user's own HF Hub
+# repos — keeping them out of the ml-intern source tree.
+# To share one publicly, push that single project folder to its own repo.
+# Pattern note: ``projects/*`` (with /*, not /) ignores contents while
+# leaving the directory traversable, so the negation can re-include
+# the template.
+projects/*
+!projects/_template/
+!projects/_template/**
+!projects/_template/**/.gitkeep
+
+# Local venvs and node modules created by ./up.sh
+static/
+oculomics-output/
+
+# Backup/scratch directories from earlier migrations
+*.tmp-hub-sync/
+.tmp-download/
+
+# Personal launcher logs
+/tmp/ml-intern.log
+/tmp/ml-intern.pid
+
+# ML / Data — anchored so they don't shadow the per-project data/
+# subdirectories that live under projects/<name>/data/.
+/data/
+/datasets/
+/models/
 checkpoint-*/
 runs/
 wandb/
 frontend/tsconfig.tsbuildinfo
+
+
+projects/
+*.db

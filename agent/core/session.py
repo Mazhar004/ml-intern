@@ -79,8 +79,14 @@ class Session:
         hf_token: str | None = None,
         local_mode: bool = False,
         stream: bool = True,
+        project_root: str | None = None,
     ):
         self.hf_token: Optional[str] = hf_token
+        # Per-session sandbox root for local_tools. When set, read/write/edit
+        # reject paths outside this directory and bash starts here. None means
+        # the session falls back to the ML_INTERN_PROJECT_ROOT env var (which
+        # may itself be unset → unrestricted).
+        self.project_root: Optional[str] = project_root
         self.tool_router = tool_router
         self.stream = stream
         tool_specs = tool_router.get_tool_specs_for_llm() if tool_router else []
@@ -199,11 +205,21 @@ class Session:
                 tools = self.tool_router.get_tool_specs_for_llm() or []
             except Exception:
                 tools = []
+        # Project name (just the basename, useful for sidebar filtering).
+        project_name: str | None = None
+        if self.project_root:
+            from pathlib import Path as _Path
+            try:
+                project_name = _Path(self.project_root).name
+            except Exception:
+                pass
+
         return {
             "session_id": self.session_id,
             "session_start_time": self.session_start_time,
             "session_end_time": datetime.now().isoformat(),
             "model_name": self.config.model_name,
+            "project": project_name,  # populated only for sessions bound to a project
             "messages": [msg.model_dump() for msg in self.context_manager.items],
             "events": self.logged_events,
             "tools": tools,

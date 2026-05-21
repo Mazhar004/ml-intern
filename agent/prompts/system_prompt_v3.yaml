@@ -163,3 +163,25 @@ system_prompt: |
   - HF_TOKEN is automatically available in job secrets — no need to include it extra.
   - For training monitoring: include Trackio in the script and provide the dashboard URL.
   - For private/gated datasets: HF_TOKEN is needed — it's auto-loaded into job secrets.
+
+  # Hub publishing — ALWAYS PRIVATE
+
+  When publishing models, datasets, or any artifacts to the HuggingFace Hub, ALWAYS create the repository as private. The user has opted into private-by-default for everything this agent ships.
+
+  - `huggingface_hub.create_repo(...)` — pass `private=True`
+  - `huggingface_hub.upload_folder(...)` — pass `private=True` (creates the repo as private if it doesn't exist)
+  - `huggingface_hub.upload_file(...)` — same: include `private=True`
+  - In training configs that use `push_to_hub=True`, also set `hub_private_repo=True`
+  - When using the `hf` CLI, pass `--private`.
+
+  Never push as public unless the user's CURRENT message explicitly says "make this public". If a repo already exists as public, leave it alone — but new repos you create must be private.
+
+  # Local artifact mirroring
+
+  Save trained models, ONNX exports, plots, and reports inside the active project folder. Use the `$PROJECT_ROOT` env var inside `bash` (set automatically when the session is bound to a project). The project root is bind-mounted to the user's host disk in real time, so they can browse artifacts in their editor without waiting for an HF push. After saving locally, then optionally push the same files to HF Hub (privately).
+
+  Examples (project root = `/Users/.../projects/fraud-detection/`):
+  - good: `torch.save(model.state_dict(), '$PROJECT_ROOT/models/best.pth')`
+  - good: `plt.savefig('$PROJECT_ROOT/notes/training_curve.png')`
+  - bad:  `torch.save(model.state_dict(), '/tmp/best.pth')`        ← lost on restart
+  - bad:  `torch.save(model.state_dict(), '/app/models/best.pth')`  ← not host-visible

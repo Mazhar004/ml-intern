@@ -24,6 +24,14 @@ interface SessionStore {
    *  Used when we rehydrate an expired session into a freshly-created backend
    *  session — preserves title, timestamps, and messages. */
   renameSession: (oldId: string, newId: string) => void;
+  /** Merge a list of archived (server-side, on-disk) sessions into the
+   *  sidebar so they're visible & clickable. Skips ids already in the store
+   *  and marks newly-added ones as expired so the UI shows the recovery
+   *  banner — clicking "Catch me up" then triggers a full /api/session/import
+   *  rehydration. Items: {session_id, saved_at, message_count, first_user_preview}. */
+  mergeArchivedSessions: (
+    archived: Array<{ session_id: string; saved_at?: string | null; message_count?: number; first_user_preview?: string }>,
+  ) => void;
 }
 
 export const useSessionStore = create<SessionStore>()(
@@ -82,7 +90,18 @@ export const useSessionStore = create<SessionStore>()(
         moveBackendMessages(oldId, newId);
         set((state) => ({
           sessions: state.sessions.map((s) =>
-            s.id === oldId ? { ...s, id: newId, expired: false } : s,
+            s.id === oldId
+              ? {
+                  ...s,
+                  id: newId,
+                  expired: false,
+                  // Remember the disk archive id so delete can also wipe
+                  // the original session_logs/<oldId>.json — otherwise the
+                  // next page load would re-hydrate it from disk and the
+                  // row would reappear in the sidebar.
+                  sourceArchiveId: s.sourceArchiveId || oldId,
+                }
+              : s,
           ),
           activeSessionId: state.activeSessionId === oldId ? newId : state.activeSessionId,
         }));
@@ -119,6 +138,74 @@ export const useSessionStore = create<SessionStore>()(
             s.id === id ? { ...s, needsAttention: needs } : s
           ),
         }));
+      },
+
+      mergeArchivedSessions: (archived) => {
+        set((state) => {
+          const archivedIds = new Set(archived.map((a) => a.session_id).filter(Boolean));
+          // Prune stale rows: any row that was previously an archived/expired
+          // entry but is no longer in the disk list — that means the user
+          // (or a cleanup script) deleted the file. Without this, stale
+          // localStorage entries keep zombie-resurrecting on every reload.
+          // Live in-memory sessions (expired: false) are left alone — they
+          // come from /api/sessions, not /api/sessions/archived.
+          const prunedSessions = state.sessions.filter((s) => {
+            if (!s.expired) return true;            // active local row, keep
+            if (archivedIds.has(s.id)) return true; // still on disk, keep
+            // Also keep if its sourceArchiveId (pre-rename) is on disk —
+            // covers the Catch-me-up case where the local id was renamed
+            // to a fresh in-memory id but the disk file kept the original.
+            if (s.sourceArchiveId && archivedIds.has(s.sourceArchiveId)) return true;
+            return false; // stale → drop
+          });
+          // knownIds includes BOTH the current row id AND its sourceArchiveId
+          // (set when "Catch me up" renamed the row). Without this, a reload
+          // after Catch me up would re-add the original archive as a NEW
+          // duplicate row (since the renamed id no longer matches).
+          const knownIds = new Set<string>();
+          for (const s of prunedSessions) {
+            knownIds.add(s.id);
+            if (s.sourceArchiveId) knownIds.add(s.sourceArchiveId);
+          }
+          // Group by (project + first 60 chars of preview) to deduplicate
+          // multiple archives of the same session (auto-saved across runs).
+          // Within each group, keep only the largest message_count.
+          const grouped = new Map<string, typeof archived[number]>();
+          for (const a of archived) {
+            if (!a.session_id || knownIds.has(a.session_id)) continue;
+            const preview = (a.first_user_preview || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+            const proj = (a as { project?: string }).project || '';
+            const key = `${proj}::${preview}`;
+            const existing = grouped.get(key);
+            if (!existing || ((a.message_count || 0) > (existing.message_count || 0))) {
+              grouped.set(key, a);
+            }
+          }
+
+          const additions: SessionMeta[] = [];
+          for (const a of grouped.values()) {
+            const preview = (a.first_user_preview || '').replace(/\s+/g, ' ').trim();
+            const title = preview ? preview.slice(0, 80) : `Archived session`;
+            const proj = (a as { project?: string }).project;
+            additions.push({
+              id: a.session_id,
+              title,
+              createdAt: a.saved_at || new Date().toISOString(),
+              isActive: false,
+              needsAttention: false,
+              expired: true,
+              messageCount: a.message_count,
+              project: proj || undefined,
+              savedAt: a.saved_at || undefined,
+              sourceArchiveId: a.session_id, // identical at hydration time
+            });
+          }
+          // If nothing pruned and nothing added, no change.
+          if (additions.length === 0 && prunedSessions.length === state.sessions.length) {
+            return state;
+          }
+          return { ...state, sessions: [...prunedSessions, ...additions] };
+        });
       },
     }),
     {

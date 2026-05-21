@@ -174,6 +174,24 @@ def _resolve_llm_params(
                 params["reasoning_effort"] = reasoning_effort
         return params
 
+    if model_name.startswith("deepseek/"):
+        # LiteLLM's ``deepseek/`` provider picks up ``DEEPSEEK_API_KEY`` and
+        # routes to https://api.deepseek.com (OpenAI-compatible). V4 models
+        # (deepseek-v4-pro, deepseek-v4-flash) default to thinking-on, which
+        # populates ``reasoning_content`` on assistant messages. DeepSeek's API
+        # *requires* that ``reasoning_content`` be echoed back on the next
+        # turn or it returns 400 — the agent loop's reasoning capture +
+        # provider-scoped scrubber (``agent_loop._scrub_reasoning_for_provider``)
+        # handles that round-trip, so thinking is left enabled here. Without
+        # thinking the model hallucinates completion in long agentic loops.
+        params: dict = {"model": model_name}
+        if reasoning_effort in {"high", "max"}:
+            # DeepSeek docs: thinking pairs with ``reasoning_effort`` of
+            # ``high`` or ``max``. Pass through when supplied; otherwise
+            # the model uses its default.
+            params["extra_body"] = {"reasoning_effort": reasoning_effort}
+        return params
+
     hf_model = model_name.removeprefix("huggingface/")
     api_key = (
         os.environ.get("INFERENCE_TOKEN")

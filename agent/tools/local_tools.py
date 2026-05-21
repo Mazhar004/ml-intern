@@ -28,11 +28,85 @@ _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
 _files_read: set[str] = set()
 
 
+def _get_project_root(session: Any = None) -> Path | None:
+    """Return the project root for this call, or None for unrestricted.
+
+    Resolution order:
+      1. ``session.project_root`` — set per-session at create time
+         (POST /api/session ``{"project": "name"}``). This is the
+         recommended way: each session gets its own sandbox.
+      2. ``ML_INTERN_PROJECT_ROOT`` env var — server-wide fallback.
+      3. None — no scoping, agent can read/write anywhere it has perms.
+
+    When set, read/write/edit reject paths outside the root and bash
+    starts there with $PROJECT_ROOT in the environment.
+
+    Bash isolation is best-effort — the agent could shell-escape via
+    absolute paths or `cd`. For hard isolation, use Docker mode.
+    """
+    # Per-session project takes precedence over env-var
+    sess_root = getattr(session, "project_root", None) if session else None
+    if sess_root:
+        try:
+            p = Path(sess_root).expanduser().resolve()
+            if p.exists() and p.is_dir():
+                return p
+        except Exception:
+            pass
+
+    raw = os.environ.get("ML_INTERN_PROJECT_ROOT", "").strip()
+    if not raw:
+        return None
+    try:
+        root = Path(raw).expanduser().resolve()
+    except Exception:
+        return None
+    if not root.exists() or not root.is_dir():
+        return None
+    return root
+
+
 def _resolve_path(path: str) -> str:
     try:
         return str(Path(path).resolve())
     except Exception:
         return path
+
+
+def _validate_path(path: str, session: Any = None) -> tuple[Path | None, str | None]:
+    """Resolve ``path`` and confirm it's inside the active project root
+    (per-session or env-var). Returns ``(resolved_path, None)`` on success
+    or ``(None, error_message)`` if the path escapes the project root.
+
+    When no project root is configured, no validation happens — the agent
+    can read/write anywhere it has OS permission to.
+    """
+    root = _get_project_root(session)
+    if root is None:
+        # No sandboxing — return the resolved path as-is.
+        try:
+            return Path(path).resolve(), None
+        except Exception as e:
+            return None, f"Could not resolve path: {e}"
+
+    try:
+        # If the agent gave a relative path, resolve relative to the project root.
+        p = Path(path)
+        if not p.is_absolute():
+            p = root / p
+        resolved = p.resolve()
+    except Exception as e:
+        return None, f"Could not resolve path: {e}"
+
+    # Path must be the root itself or a descendant.
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return None, (
+            f"Path '{path}' is outside the project sandbox at {root}. "
+            f"All file operations must stay inside this directory."
+        )
+    return resolved, None
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -93,12 +167,34 @@ def _truncate_output(output: str, max_chars: int = MAX_OUTPUT_CHARS, head_ratio:
 
 # ── Handlers ────────────────────────────────────────────────────────────
 
-async def _bash_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
+async def _bash_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
     command = args.get("command", "")
     if not command:
         return "No command provided.", False
-    work_dir = args.get("work_dir", ".")
     timeout = min(args.get("timeout") or DEFAULT_TIMEOUT, MAX_TIMEOUT)
+
+    # Force bash cwd into the session's project root (or the env-var default).
+    # Validate any explicit work_dir argument falls inside it. Best-effort
+    # isolation: the agent could still cd out via shell, but commands launch
+    # in the right place by default.
+    root = _get_project_root(session)
+    requested_dir = args.get("work_dir")
+    if root is None:
+        work_dir = requested_dir or "."
+    elif requested_dir is None:
+        work_dir = str(root)
+    else:
+        resolved, err = _validate_path(requested_dir, session)
+        if err:
+            return err, False
+        work_dir = str(resolved)
+
+    # Pass the project root as PROJECT_ROOT so the agent can reference it in
+    # commands like `cd "$PROJECT_ROOT/data" && ls`.
+    env = os.environ.copy()
+    if root is not None:
+        env["PROJECT_ROOT"] = str(root)
+
     try:
         result = subprocess.run(
             command,
@@ -106,6 +202,7 @@ async def _bash_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
             capture_output=True,
             text=True,
             cwd=work_dir,
+            env=env,
             timeout=timeout,
         )
         output = _strip_ansi(result.stdout + result.stderr)
@@ -126,11 +223,13 @@ async def _bash_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
         return f"bash error: {e}", False
 
 
-async def _read_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
+async def _read_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
     file_path = args.get("path", "")
     if not file_path:
         return "No path provided.", False
-    p = Path(file_path)
+    p, err = _validate_path(file_path, session)
+    if err:
+        return err, False
     if not p.exists():
         return f"File not found: {file_path}", False
     if p.is_dir():
@@ -156,12 +255,14 @@ async def _read_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
     return "\n".join(numbered), True
 
 
-async def _write_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
+async def _write_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
     file_path = args.get("path", "")
     content = args.get("content", "")
     if not file_path:
         return "No path provided.", False
-    p = Path(file_path)
+    p, err = _validate_path(file_path, session)
+    if err:
+        return err, False
     if p.exists() and _resolve_path(file_path) not in _files_read:
         return (
             f"You must read {file_path} before overwriting it. "
@@ -182,7 +283,7 @@ async def _write_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
         return f"write error: {e}", False
 
 
-async def _edit_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
+async def _edit_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
     from agent.tools.edit_utils import apply_edit, validate_python
 
     file_path = args.get("path", "")
@@ -196,7 +297,9 @@ async def _edit_handler(args: dict[str, Any], **_kw) -> tuple[str, bool]:
     if old_str == new_str:
         return "old_str and new_str must differ.", False
 
-    p = Path(file_path)
+    p, err = _validate_path(file_path, session)
+    if err:
+        return err, False
     if not p.exists():
         return f"File not found: {file_path}", False
     if _resolve_path(file_path) not in _files_read:

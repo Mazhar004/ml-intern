@@ -294,12 +294,84 @@ class LLMResult:
     token_count: int
     finish_reason: str | None
     usage: dict = field(default_factory=dict)
+    # DeepSeek V4 (and any other provider with extended-thinking-style
+    # responses) returns this alongside content. We must echo it back on the
+    # next turn for DeepSeek or the API returns 400. Captured here so the
+    # main loop can attach it to the stored assistant Message.
+    reasoning_content: str | None = None
+
+
+def _supports_reasoning_echo(model_name: str | None) -> bool:
+    """Whether the provider for ``model_name`` requires (or tolerates) the
+    previous turn's ``reasoning_content`` echoed back in the request.
+
+    Currently only DeepSeek's V4 thinking mode mandates this. Other
+    providers (HF Router OpenAI-compat, Anthropic, OpenAI direct) reject
+    or silently drop the field — so we strip it on the wire for them.
+    """
+    return bool(model_name) and model_name.startswith("deepseek/")
+
+
+def _scrub_reasoning_for_provider(messages: list, model_name: str | None) -> list:
+    """Provider-aware ``reasoning_content`` normalization on outbound messages.
+
+    For DeepSeek (V4 thinking mode), the API enforces a stronger rule than
+    "echo what you got": **every** assistant message in a thinking-mode
+    sequence must carry ``reasoning_content`` (empty string is fine). A
+    ``null`` field on any single turn — typical when the model elected not
+    to think on a wrap-up turn — triggers a 400. So for DeepSeek we
+    coerce missing reasoning_content to ``""`` on every assistant message
+    before sending.
+
+    For every other provider (HF Router OpenAI-compat, Anthropic, OpenAI
+    direct), the field is unwanted and we strip it. We shallow-copy each
+    affected message so we don't mutate the stored history (which we keep
+    intact in case the user swaps the model later).
+    """
+    deepseek_echo = _supports_reasoning_echo(model_name)
+    out = []
+    mutated = False
+    for m in messages:
+        if m.get("role") if isinstance(m, dict) else getattr(m, "role", None) != "assistant":
+            out.append(m)
+            continue
+        rc = getattr(m, "reasoning_content", None) if not isinstance(m, dict) else m.get("reasoning_content")
+        if deepseek_echo:
+            if rc is None:
+                try:
+                    cleaned = m.model_copy(update={"reasoning_content": ""})
+                except AttributeError:
+                    cleaned = m
+                    try:
+                        cleaned.reasoning_content = ""
+                    except Exception:
+                        pass
+                out.append(cleaned)
+                mutated = True
+            else:
+                out.append(m)
+        else:
+            if rc:
+                try:
+                    cleaned = m.model_copy(update={"reasoning_content": None})
+                except AttributeError:
+                    cleaned = m
+                    try:
+                        cleaned.reasoning_content = None
+                    except Exception:
+                        pass
+                out.append(cleaned)
+                mutated = True
+            else:
+                out.append(m)
+    return out if mutated else messages
 
 
 async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> LLMResult:
     """Call the LLM with streaming, emitting assistant_chunk events."""
     response = None
     _healed_effort = False  # one-shot safety net per call
+    messages = _scrub_reasoning_for_provider(messages, llm_params.get("model"))
     messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
@@ -340,6 +412,7 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
             raise
 
     full_content = ""
+    full_reasoning = ""
     tool_calls_acc: dict[int, dict] = {}
     token_count = 0
     finish_reason = None
@@ -366,6 +439,14 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
             await session.send_event(
                 Event(event_type="assistant_chunk", data={"content": delta.content})
             )
+
+        # DeepSeek V4 streams thinking via ``delta.reasoning_content``. We
+        # accumulate it but don't surface it to the UI as token chunks — the
+        # frontend only renders ``content``. Stored on the assistant message
+        # so the next round-trip can echo it back to satisfy DeepSeek's API.
+        rc_delta = getattr(delta, "reasoning_content", None)
+        if rc_delta:
+            full_reasoning += rc_delta
 
         if delta.tool_calls:
             for tc_delta in delta.tool_calls:
@@ -401,6 +482,7 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
         token_count=token_count,
         finish_reason=finish_reason,
         usage=usage,
+        reasoning_content=full_reasoning or None,
     )
 
 
@@ -408,6 +490,7 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
     """Call the LLM without streaming, emit assistant_message at the end."""
     response = None
     _healed_effort = False
+    messages = _scrub_reasoning_for_provider(messages, llm_params.get("model"))
     messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
@@ -449,6 +532,7 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
     choice = response.choices[0]
     message = choice.message
     content = message.content or None
+    reasoning_content = getattr(message, "reasoning_content", None) or None
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0
 
@@ -485,6 +569,7 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
         token_count=token_count,
         finish_reason=finish_reason,
         usage=usage,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -709,11 +794,16 @@ class Handlers:
                         tc.function.arguments = "{}"
                         bad_tools.append(tc)
 
-                # Add assistant message with all tool calls to context
+                # Add assistant message with all tool calls to context.
+                # Persist ``reasoning_content`` when the model provided it
+                # (DeepSeek V4 thinking mode) — it gets echoed back on the
+                # next turn for providers that require it. The provider-aware
+                # scrubber strips it before sending to providers that don't.
                 assistant_msg = Message(
                     role="assistant",
                     content=content,
                     tool_calls=tool_calls,
+                    reasoning_content=getattr(llm_result, "reasoning_content", None),
                 )
                 session.context_manager.add_message(assistant_msg, token_count)
 

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
   Box,
@@ -25,12 +25,37 @@ interface SessionSidebarProps {
 }
 
 export default function SessionSidebar({ onClose }: SessionSidebarProps) {
-  const { sessions, activeSessionId, createSession, deleteSession, switchSession } =
+  const { sessions, activeSessionId, createSession, deleteSession, switchSession, mergeArchivedSessions } =
     useSessionStore();
   const { setPlan, clearPanel } =
     useAgentStore();
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [capacityError, setCapacityError] = useState<string | null>(null);
+
+  // -- Hydrate the sidebar with on-disk archived sessions on mount ---------
+  // /api/sessions/archived returns every session_logs/<uuid>_*.json the
+  // backend has on disk — including ones created from a different browser
+  // profile, via curl, or before this browser's localStorage was populated.
+  // We merge them as `expired: true` so they show "needs a catch-up" — when
+  // the user clicks one and hits Catch me up, /api/session/import does a
+  // full restore.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/sessions/archived');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled || !Array.isArray(data)) return;
+        mergeArchivedSessions(data);
+      } catch {
+        // best-effort: archived listing is a convenience, not load-bearing
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mergeArchivedSessions]);
 
   // -- Handlers -----------------------------------------------------------
 
@@ -39,7 +64,38 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     setIsCreatingSession(true);
     setCapacityError(null);
     try {
-      const response = await apiFetch('/api/session', { method: 'POST' });
+      // Project picker: prompt for the project folder this session lives in.
+      // Empty input → no project sandbox (server-wide ML_INTERN_PROJECT_ROOT
+      // env var still applies if set). Pre-fill the last-used project from
+      // localStorage so jumping between sessions on the same project is fast.
+      let existing: { name: string }[] = [];
+      try {
+        const r = await apiFetch('/api/projects');
+        if (r.ok) existing = await r.json();
+      } catch { /* listing is best-effort */ }
+      const last = localStorage.getItem('ml-intern.lastProject') || '';
+      const hint = existing.length
+        ? `\n\nExisting projects:\n  ${existing.map((p) => p.name).join('\n  ')}`
+        : '';
+      const project = window.prompt(
+        `Project name for this session (leave blank for none).\n` +
+        `Files written by the agent will go into projects/<name>/.${hint}`,
+        last,
+      );
+      // null means user cancelled the prompt — abort entirely.
+      if (project === null) {
+        return;
+      }
+      const trimmed = project.trim();
+      if (trimmed) {
+        localStorage.setItem('ml-intern.lastProject', trimmed);
+      }
+
+      const response = await apiFetch('/api/session', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(trimmed ? { project: trimmed } : {}),
+      });
       if (response.status === 503) {
         const data = await response.json();
         setCapacityError(data.detail || 'Server is at capacity.');
@@ -72,13 +128,25 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
   const handleDeleteConfirm = useCallback(async () => {
     if (!confirmDeleteId || isDeleting) return;
     const sessionId = confirmDeleteId;
+    const sessionRow = sessions.find((s) => s.id === sessionId);
     setIsDeleting(true);
 
     const isLastSession = sessions.length === 1;
 
     useAgentStore.getState().clearSessionState(sessionId);
     try {
-      await apiFetch(`/api/session/${sessionId}`, { method: 'DELETE' });
+      // Wipe ALL layers so the row doesn't reappear on next reload:
+      //   1. In-memory backend session (if any)
+      //   2. Disk archive at the CURRENT id
+      //   3. Disk archive at the ORIGINAL id (before Catch me up renamed it)
+      const archiveIds = new Set<string>([sessionId]);
+      if (sessionRow?.sourceArchiveId) archiveIds.add(sessionRow.sourceArchiveId);
+      await Promise.allSettled([
+        apiFetch(`/api/session/${sessionId}`, { method: 'DELETE' }),
+        ...Array.from(archiveIds).map((id) =>
+          apiFetch(`/api/sessions/archived/${id}`, { method: 'DELETE' }),
+        ),
+      ]);
       deleteSession(sessionId);
     } catch {
       deleteSession(sessionId);
@@ -248,20 +316,49 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
                 />
 
                 <Box sx={{ flex: 1, minWidth: 0 }}>
-                  <Typography
-                    variant="body2"
-                    sx={{
-                      fontWeight: isSelected ? 600 : 400,
-                      color: 'var(--text)',
-                      fontSize: '0.84rem',
-                      lineHeight: 1.4,
-                      whiteSpace: 'nowrap',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                    }}
-                  >
-                    {session.title.startsWith('Chat ') ? `Session ${String(num).padStart(2, '0')}` : session.title}
-                  </Typography>
+                  {/* Title row: project tag + truncated preview */}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
+                    {session.project && (
+                      <Box
+                        component="span"
+                        sx={{
+                          fontSize: '0.6rem',
+                          fontWeight: 600,
+                          color: 'var(--accent-yellow)',
+                          bgcolor: 'rgba(255, 168, 0, 0.12)',
+                          px: 0.6,
+                          py: 0.05,
+                          borderRadius: 0.5,
+                          flexShrink: 0,
+                          textTransform: 'uppercase',
+                          letterSpacing: 0.3,
+                          maxWidth: 100,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {session.project}
+                      </Box>
+                    )}
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        fontWeight: isSelected ? 600 : 400,
+                        color: 'var(--text)',
+                        fontSize: '0.84rem',
+                        lineHeight: 1.4,
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        flex: 1,
+                        minWidth: 0,
+                      }}
+                    >
+                      {session.title.startsWith('Chat ') ? `Session ${String(num).padStart(2, '0')}` : session.title}
+                    </Typography>
+                  </Box>
+                  {/* Subtitle row: status · message count · time */}
                   <Typography
                     variant="caption"
                     sx={{
@@ -270,7 +367,11 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
                       lineHeight: 1.2,
                     }}
                   >
-                    {session.expired ? 'needs a catch-up' : formatTime(session.createdAt)}
+                    {[
+                      session.expired ? 'needs a catch-up' : null,
+                      session.messageCount ? `${session.messageCount} msgs` : null,
+                      formatTime(session.savedAt || session.createdAt),
+                    ].filter(Boolean).join(' · ')}
                   </Typography>
                 </Box>
 

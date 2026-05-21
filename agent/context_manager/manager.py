@@ -113,9 +113,14 @@ async def summarize_messages(
     Returns ``(summary_text, completion_tokens)``.
     """
     from agent.core.llm_params import _resolve_llm_params
+    from agent.core.agent_loop import _scrub_reasoning_for_provider
 
     prompt_messages = list(messages) + [Message(role="user", content=prompt)]
     llm_params = _resolve_llm_params(model_name, hf_token, reasoning_effort="high")
+    # Mirror the scrubbing the main agent loop does. Without this, DeepSeek
+    # thinking-mode 400s on a missing reasoning_content during summarize/restore
+    # because previous assistant turns may not carry the field.
+    prompt_messages = _scrub_reasoning_for_provider(prompt_messages, llm_params.get("model"))
     prompt_messages, tool_specs = with_prompt_caching(
         prompt_messages, tool_specs, llm_params.get("model")
     )

@@ -1,0 +1,53 @@
+services:
+  ml-intern:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ml-intern:local
+    container_name: ml-intern
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    volumes:
+      # Session histories — bind-mounted so native and Docker modes share
+      # the same session_logs/ directory. Restart either backend and the
+      # other one's saved sessions are visible via /api/sessions/archived.
+      - ./backend/session_logs:/app/backend/session_logs
+      # HuggingFace + tool caches so re-pulls don't happen on every restart.
+      - ml-intern-hf-cache:/home/user/.cache/huggingface
+      - ml-intern-uv-cache:/home/user/.cache/uv
+      # Bidirectional workspace mount.
+      # The backend resolves each project root relative to the app root
+      # (Path(__file__).parent.parent == /app, see backend/session_manager.py),
+      # so projects are created under /app/projects/<name> inside the container.
+      # The mount target MUST match that path or new projects land in the
+      # container's ephemeral layer and are lost on recreate. Mounting host
+      # ./projects -> /app/projects keeps every project on the host.
+      # Each subdirectory under projects/ is a self-contained research
+      # project with its own data/, code/, models/, notes/.
+      - ./projects:/app/projects
+
+  # Optional trainer/runner with PyTorch + ONNX preinstalled. Idle by default
+  # (uses the "oculomics" profile so `docker compose up` skips it). Invoke
+  # specific commands like:
+  #   docker compose run --rm oculomics python code/train_e2e.py
+  # Builds from any project that has a Dockerfile at code/Dockerfile —
+  # currently projects/oculomics/code/Dockerfile.
+  oculomics:
+    build:
+      context: ./projects/oculomics/code
+      dockerfile: Dockerfile
+    image: oculomics:local
+    profiles: ["oculomics"]
+    working_dir: /workspace/projects/oculomics
+    env_file:
+      - .env
+    volumes:
+      - ./projects:/workspace/projects
+      - ml-intern-hf-cache:/root/.cache/huggingface
+
+volumes:
+  ml-intern-hf-cache:
+  ml-intern-uv-cache:

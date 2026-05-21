@@ -21,6 +21,22 @@ export interface SessionMeta {
    *  disables input until the user chooses to restore-with-summary or
    *  start fresh. */
   expired?: boolean;
+  /** Number of messages in the archived session — populated when
+   *  hydrated from /api/sessions/archived. Shown as a subtitle so the
+   *  user can pick the right one to resume at a glance. */
+  messageCount?: number;
+  /** Project folder this session is bound to (just the folder name,
+   *  not the full path). Populated for new sessions created via the
+   *  project picker, and for archived sessions if the field was saved. */
+  project?: string;
+  /** ISO datetime when the disk snapshot was last written (only for
+   *  archived sessions). */
+  savedAt?: string;
+  /** Original archive session id this row was hydrated/imported from.
+   *  Set when ``mergeArchivedSessions`` adds a row from /api/sessions/archived,
+   *  preserved across ``renameSession`` (used by Catch-me-up) so that
+   *  Delete can also remove the original disk file under the old id. */
+  sourceArchiveId?: string;
 }
 
 export interface ToolApproval {

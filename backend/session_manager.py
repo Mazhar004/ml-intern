@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -135,6 +136,7 @@ class SessionManager:
         user_id: str = "dev",
         hf_token: str | None = None,
         model: str | None = None,
+        project: str | None = None,
     ) -> str:
         """Create a new agent session and return its ID.
 
@@ -182,9 +184,44 @@ class SessionManager:
         # blocks all HTTP/SSE handling.
         import time as _time
 
+        # ``ML_INTERN_LOCAL_MODE=1`` strips the remote HF Space sandbox
+        # (sandbox_create + its bash/write/read/edit) from the tool registry,
+        # so the agent uses ``local_tools`` instead — subprocess execution in
+        # this server's process. On a native macOS install this means the
+        # agent has direct access to the host's MPS GPU and doesn't incur HF
+        # Space costs. Set in .env or shell before starting uvicorn.
+        local_mode = os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in ("1", "true", "yes")
+
+        # Resolve a per-session project root. Each session can be tied to its
+        # own folder under ``./projects/<name>/`` so that two sessions can be
+        # active simultaneously without their bash/write/edit calls colliding.
+        # Auto-creates the folder + scaffold subdirs (data/, code/, models/,
+        # notes/, prompts/) if missing. Empty/None falls back to the env-var
+        # ML_INTERN_PROJECT_ROOT (server-wide) or no scoping at all.
+        project_root: str | None = None
+        if project and project.strip():
+            from pathlib import Path as _Path
+            safe_name = project.strip().replace("/", "-").replace("..", "-")
+            # Resolve projects/ relative to the repo root (the parent of
+            # backend/), not the backend cwd, so the directory matches what
+            # the user sees on disk regardless of how the server was started.
+            repo_root = _Path(__file__).resolve().parent.parent
+            base = (repo_root / "projects" / safe_name).resolve()
+            base.mkdir(parents=True, exist_ok=True)
+            for sub in ("data", "code", "models", "notes", "prompts"):
+                (base / sub).mkdir(exist_ok=True)
+            readme = base / "README.md"
+            if not readme.exists():
+                readme.write_text(
+                    f"# {safe_name}\n\nCreated by ml-intern. Drop datasets in `data/`, "
+                    "the agent will write code/, models/, and notes/.\n"
+                )
+            project_root = str(base)
+            logger.info(f"Session bound to project: {project_root}")
+
         def _create_session_sync():
             t0 = _time.monotonic()
-            tool_router = ToolRouter(self.config.mcpServers, hf_token=hf_token)
+            tool_router = ToolRouter(self.config.mcpServers, hf_token=hf_token, local_mode=local_mode)
             # Deep-copy config so each session's model switches independently —
             # tab A picking GLM doesn't flip tab B off Claude.
             session_config = self.config.model_copy(deep=True)
@@ -192,7 +229,8 @@ class SessionManager:
                 session_config.model_name = model
             session = Session(
                 event_queue, config=session_config, tool_router=tool_router,
-                hf_token=hf_token,
+                hf_token=hf_token, local_mode=local_mode,
+                project_root=project_root,
             )
             t1 = _time.monotonic()
             logger.info(f"Session initialized in {t1 - t0:.2f}s")
@@ -509,6 +547,13 @@ class SessionManager:
                     "arguments": args,
                 })
 
+        # Project folder name (just the basename, not the absolute path)
+        project_name: str | None = None
+        proot = getattr(agent_session.session, "project_root", None)
+        if proot:
+            from pathlib import Path as _Path
+            project_name = _Path(proot).name
+
         return {
             "session_id": session_id,
             "created_at": agent_session.created_at.isoformat(),
@@ -518,6 +563,7 @@ class SessionManager:
             "user_id": agent_session.user_id,
             "pending_approval": pending_approval,
             "model": agent_session.session.config.model_name,
+            "project": project_name,
         }
 
     def list_sessions(self, user_id: str | None = None) -> list[dict[str, Any]]:

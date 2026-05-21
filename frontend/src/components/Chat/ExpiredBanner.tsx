@@ -26,15 +26,33 @@ export default function ExpiredBanner({ sessionId }: Props) {
     setBusy('catch-up');
     setError(null);
     try {
-      // Prefer the raw backend-message cache; fall back to reconstructing
-      // from UIMessages (for sessions that predate the backend cache).
+      // Strategy 1 (preferred): full restore from session_logs/ on disk via
+      // /api/session/import. Loses nothing — every original message, every
+      // tool call comes back.
+      const importRes = await apiFetch('/api/session/import', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (importRes.ok) {
+        const data = await importRes.json();
+        const newId = data.session_id as string | undefined;
+        if (newId) {
+          useAgentStore.getState().clearSessionState(sessionId);
+          renameSession(sessionId, newId);
+          return;
+        }
+      }
+
+      // Strategy 2 (fallback, lossy): if no archive on disk, rebuild from
+      // the browser's localStorage cache and summarize. Older flow.
       let messages = loadBackendMessages(sessionId);
       if (!messages || messages.length === 0) {
         const uiMsgs = loadMessages(sessionId);
         if (uiMsgs.length > 0) messages = uiMessagesToLLMMessages(uiMsgs);
       }
       if (!messages || messages.length === 0) {
-        setError('Nothing to summarize from this chat.');
+        setError("This session isn't on disk and your browser cache is empty — nothing to restore. Click Start fresh.");
         setBusy(null);
         return;
       }

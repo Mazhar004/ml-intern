@@ -86,6 +86,7 @@ class SessionInfo(BaseModel):
     user_id: str = "dev"
     pending_approval: list[PendingApprovalTool] | None = None
     model: str | None = None
+    project: str | None = None  # project folder name, if session is bound to one
 
 
 class HealthResponse(BaseModel):

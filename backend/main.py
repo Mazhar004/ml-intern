@@ -46,16 +46,27 @@ async def lifespan(app: FastAPI):
 
     # Final-flush: save every still-active session so we don't lose traces on
     # server restart. Uploads are detached subprocesses — this is fast.
+    # Skip sessions that never received a user message (they only contain the
+    # system prompt) — flushing those creates 1-msg dummy files that pollute
+    # the sidebar and the archived list.
     try:
         from session_manager import session_manager
         for sid, agent_session in list(session_manager.sessions.items()):
             sess = agent_session.session
-            if sess.config.save_sessions:
-                try:
-                    sess.save_and_upload_detached(sess.config.session_dataset_repo)
-                    logger.info("Flushed session %s on shutdown", sid)
-                except Exception as e:
-                    logger.warning("Failed to flush session %s: %s", sid, e)
+            if not sess.config.save_sessions:
+                continue
+            user_messages = sum(
+                1 for m in sess.context_manager.items
+                if getattr(m, "role", None) == "user"
+            )
+            if user_messages == 0:
+                logger.info("Skipping flush of empty session %s on shutdown", sid)
+                continue
+            try:
+                sess.save_and_upload_detached(sess.config.session_dataset_repo)
+                logger.info("Flushed session %s on shutdown", sid)
+            except Exception as e:
+                logger.warning("Failed to flush session %s: %s", sid, e)
     except Exception as e:
         logger.warning("Lifespan final-flush skipped: %s", e)
 
