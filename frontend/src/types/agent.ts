@@ -16,6 +16,7 @@ export interface SessionMeta {
   createdAt: string;
   isActive: boolean;
   needsAttention: boolean;
+  model?: string | null;
   /** True when the backend no longer recognizes this session id (e.g.
    *  after a backend restart). The UI shows a recovery banner and
    *  disables input until the user chooses to restore-with-summary or
@@ -37,12 +38,17 @@ export interface SessionMeta {
    *  preserved across ``renameSession`` (used by Catch-me-up) so that
    *  Delete can also remove the original disk file under the old id. */
   sourceArchiveId?: string;
+  autoApprovalEnabled?: boolean;
+  autoApprovalCostCapUsd?: number | null;
+  autoApprovalEstimatedSpendUsd?: number;
+  autoApprovalRemainingUsd?: number | null;
 }
 
 export interface ToolApproval {
   tool_call_id: string;
   approved: boolean;
   feedback?: string | null;
+  namespace?: string | null;
 }
 
 export interface User {
@@ -50,5 +56,4 @@ export interface User {
   username?: string;
   name?: string;
   picture?: string;
-  orgMember?: boolean;
 }

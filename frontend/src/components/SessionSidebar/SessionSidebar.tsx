@@ -25,23 +25,42 @@ interface SessionSidebarProps {
 }
 
 export default function SessionSidebar({ onClose }: SessionSidebarProps) {
-  const { sessions, activeSessionId, createSession, deleteSession, switchSession, mergeArchivedSessions } =
+  const {
+    sessions,
+    activeSessionId,
+    createSession,
+    deleteSession,
+    switchSession,
+    mergeArchivedSessions,
+    mergeServerSessions,
+  } =
     useSessionStore();
   const { setPlan, clearPanel } =
     useAgentStore();
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [capacityError, setCapacityError] = useState<string | null>(null);
 
-  // -- Hydrate the sidebar with on-disk archived sessions on mount ---------
-  // /api/sessions/archived returns every session_logs/<uuid>_*.json the
-  // backend has on disk — including ones created from a different browser
-  // profile, via curl, or before this browser's localStorage was populated.
-  // We merge them as `expired: true` so they show "needs a catch-up" — when
-  // the user clicks one and hits Catch me up, /api/session/import does a
-  // full restore.
+  // -- Hydrate the sidebar on mount ----------------------------------------
+  // Two sources, merged: (1) /api/sessions — live/durable sessions the
+  // backend currently knows about (shown as active, clickable rows);
+  // (2) /api/sessions/archived — every session_logs/<uuid>_*.json on disk,
+  // including ones from another browser, created via curl, or saved before
+  // this browser's localStorage was populated. Archived rows show as
+  // "needs a catch-up"; clicking one + Catch me up runs /api/session/import
+  // for a full restore. Server sessions are merged first so the archived
+  // pass de-dupes against them and never adds a duplicate live row.
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      try {
+        const response = await apiFetch('/api/sessions');
+        if (response.ok) {
+          const live = await response.json();
+          if (!cancelled && Array.isArray(live)) mergeServerSessions(live);
+        }
+      } catch {
+        /* live listing is best-effort; archived + local metadata still work */
+      }
       try {
         const res = await apiFetch('/api/sessions/archived');
         if (!res.ok) return;
@@ -55,7 +74,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     return () => {
       cancelled = true;
     };
-  }, [mergeArchivedSessions]);
+  }, [mergeArchivedSessions, mergeServerSessions]);
 
   // -- Handlers -----------------------------------------------------------
 
@@ -102,7 +121,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         return;
       }
       const data = await response.json();
-      createSession(data.session_id);
+      createSession(data.session_id, data.model);
       setPlan([]);
       clearPanel();
       onClose?.();
@@ -158,7 +177,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         const response = await apiFetch('/api/session', { method: 'POST' });
         if (response.ok) {
           const data = await response.json();
-          createSession(data.session_id);
+          createSession(data.session_id, data.model);
           setPlan([]);
           clearPanel();
         }
