@@ -305,11 +305,63 @@ export const useSessionStore = create<SessionStore>()(
               sourceArchiveId: a.session_id, // identical at hydration time
             });
           }
-          // If nothing pruned and nothing added, no change.
-          if (additions.length === 0 && prunedSessions.length === state.sessions.length) {
+          // Final de-dup pass over the COMBINED list (existing rows +
+          // additions + any live rows from mergeServerSessions). The grouping
+          // above only de-dups the new additions; without this pass, two
+          // archives of the same conversation saved under different session
+          // ids across runs would each survive every reload (both files are
+          // on disk, so the prune keeps both) and show as duplicate rows.
+          // Collapse rows that share (project + normalized title), keeping the
+          // best representative; rows without a meaningful title key only on
+          // their id so distinct untitled sessions are never merged.
+          const combined = [...prunedSessions, ...additions];
+          const dedupKeyOf = (s: SessionMeta): string => {
+            const t = (s.title || '')
+              .toLowerCase()
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 60);
+            if (!t || t === 'archived session') return `id::${s.id}`;
+            return `${s.project || ''}::${t}`;
+          };
+          // Pick the best representative of a duplicate group: a live
+          // (in-memory) session always beats an archive; otherwise keep the
+          // most complete (largest message_count), then the most recent.
+          const isBetter = (cand: SessionMeta, cur: SessionMeta): boolean => {
+            if (!!cand.expired !== !!cur.expired) return !cand.expired;
+            const cm = cand.messageCount || 0;
+            const um = cur.messageCount || 0;
+            if (cm !== um) return cm > um;
+            return (
+              (cand.savedAt || cand.createdAt || '') >
+              (cur.savedAt || cur.createdAt || '')
+            );
+          };
+          const byKey = new Map<string, SessionMeta>();
+          for (const s of combined) {
+            const key = dedupKeyOf(s);
+            const existing = byKey.get(key);
+            if (!existing || isBetter(s, existing)) byKey.set(key, s);
+          }
+          const deduped = Array.from(byKey.values());
+          // If the active/selected row got collapsed into a fuller sibling,
+          // move the selection to the row we kept so the UI stays consistent.
+          const dedupedIds = new Set(deduped.map((s) => s.id));
+          let activeSessionId = state.activeSessionId;
+          if (activeSessionId && !dedupedIds.has(activeSessionId)) {
+            const activeRow = state.sessions.find((s) => s.id === activeSessionId);
+            const kept = activeRow ? byKey.get(dedupKeyOf(activeRow)) : undefined;
+            activeSessionId = kept ? kept.id : null;
+          }
+          // No-op guard: same rows in the same order AND unchanged selection.
+          if (
+            activeSessionId === state.activeSessionId &&
+            deduped.length === state.sessions.length &&
+            deduped.every((s, i) => s.id === state.sessions[i]?.id)
+          ) {
             return state;
           }
-          return { ...state, sessions: [...prunedSessions, ...additions] };
+          return { ...state, sessions: deduped, activeSessionId };
         });
       },
     }),
