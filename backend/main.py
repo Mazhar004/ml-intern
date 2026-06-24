@@ -1,5 +1,6 @@
 """FastAPI application for HF Agent web interface."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -10,8 +11,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# Load .env before importing routes/session_manager so persistence and quota
-# modules see local Mongo settings during startup.
+# Load .env before importing routes/session_manager so persistence and model
+# modules see local settings during startup.
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from routes.agent import router as agent_router  # noqa: E402
@@ -24,6 +25,33 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+SHUTDOWN_USAGE_REFRESH_CONCURRENCY = 32
+
+
+async def _flush_session_on_shutdown(sid: str, agent_session, semaphore) -> None:
+    sess = agent_session.session
+    if not sess.config.save_sessions:
+        return
+    # Skip sessions that never received a user message (they only contain the
+    # system prompt) — flushing those creates 1-msg dummy files that pollute
+    # the sidebar and the archived list. Cheap to skip before the semaphore.
+    user_messages = sum(
+        1 for m in sess.context_manager.items
+        if getattr(m, "role", None) == "user"
+    )
+    if user_messages == 0:
+        logger.info("Skipping flush of empty session %s on shutdown", sid)
+        return
+    try:
+        async with semaphore:
+            await session_manager.refresh_session_usage_metrics(
+                agent_session,
+                error_code="lifespan_billing_snapshot_error",
+            )
+            sess.save_and_upload_detached(sess.config.session_dataset_repo)
+            logger.info("Flushed session %s on shutdown", sid)
+    except Exception as e:
+        logger.warning("Failed to flush session %s: %s", sid, e)
 
 
 @asynccontextmanager
@@ -50,27 +78,16 @@ async def lifespan(app: FastAPI):
         logger.warning("KPI scheduler shutdown failed: %s", e)
 
     # Final-flush: save every still-active session so we don't lose traces on
-    # server restart. Uploads are detached subprocesses — this is fast.
-    # Skip sessions that never received a user message (they only contain the
-    # system prompt) — flushing those creates 1-msg dummy files that pollute
-    # the sidebar and the archived list.
+    # server restart. Billing refreshes are timeboxed and bounded; uploads are
+    # detached subprocesses. Empty sessions are skipped inside the helper.
     try:
-        for sid, agent_session in list(session_manager.sessions.items()):
-            sess = agent_session.session
-            if not sess.config.save_sessions:
-                continue
-            user_messages = sum(
-                1 for m in sess.context_manager.items
-                if getattr(m, "role", None) == "user"
+        semaphore = asyncio.Semaphore(SHUTDOWN_USAGE_REFRESH_CONCURRENCY)
+        await asyncio.gather(
+            *(
+                _flush_session_on_shutdown(sid, agent_session, semaphore)
+                for sid, agent_session in list(session_manager.sessions.items())
             )
-            if user_messages == 0:
-                logger.info("Skipping flush of empty session %s on shutdown", sid)
-                continue
-            try:
-                sess.save_and_upload_detached(sess.config.session_dataset_repo)
-                logger.info("Flushed session %s on shutdown", sid)
-            except Exception as e:
-                logger.warning("Failed to flush session %s: %s", sid, e)
+        )
     except Exception as e:
         logger.warning("Lifespan final-flush skipped: %s", e)
     await session_manager.close()

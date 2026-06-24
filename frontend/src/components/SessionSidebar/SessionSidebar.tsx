@@ -18,6 +18,7 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
+import { useUsageStore } from '@/store/usageStore';
 import { apiFetch } from '@/utils/api';
 
 interface SessionSidebarProps {
@@ -122,6 +123,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
       }
       const data = await response.json();
       createSession(data.session_id, data.model);
+      void useUsageStore.getState().fetchUsage(data.session_id);
       setPlan([]);
       clearPanel();
       onClose?.();
@@ -178,6 +180,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         if (response.ok) {
           const data = await response.json();
           createSession(data.session_id, data.model);
+          void useUsageStore.getState().fetchUsage(data.session_id);
           setPlan([]);
           clearPanel();
         }
@@ -192,12 +195,28 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
 
   const handleSelect = useCallback(
     (sessionId: string) => {
+      const shouldActivateSession = sessionId !== activeSessionId;
       switchSession(sessionId);
+      if (shouldActivateSession) {
+        void (async () => {
+          try {
+            const response = await apiFetch(`/api/session/${sessionId}/activate`, {
+              method: 'POST',
+            });
+            if (!response.ok) return;
+            const info = await response.json();
+            mergeServerSessions([info]);
+            void useUsageStore.getState().fetchUsage(sessionId);
+          } catch {
+            /* best effort: usage falls back to the existing session metadata */
+          }
+        })();
+      }
       // Per-session state (plan, panel, activity) is restored automatically
       // by SessionChat's useEffect when isActive flips to true.
       onClose?.();
     },
-    [switchSession, onClose],
+    [activeSessionId, mergeServerSessions, switchSession, onClose],
   );
 
   const formatTime = (d: string) =>

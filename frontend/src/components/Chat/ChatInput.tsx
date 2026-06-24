@@ -20,24 +20,23 @@ import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import StopIcon from '@mui/icons-material/Stop';
 import AddIcon from '@mui/icons-material/Add';
 import { apiFetch, apiUpload } from '@/utils/api';
-import { useUserQuota } from '@/hooks/useUserQuota';
-import ClaudeCapDialog from '@/components/ClaudeCapDialog';
 import JobsUpgradeDialog from '@/components/JobsUpgradeDialog';
 import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import {
-  CLAUDE_MODEL_PATH,
-  FIRST_FREE_MODEL_PATH,
+  CLAUDE_OPUS_48_MODEL_PATH,
+  DEEPSEEK_V4_PRO_DIRECT_PATH,
+  GLM_52_MODEL_PATH,
   GPT_55_MODEL_PATH,
+  KIMI_K27_CODE_MODEL_PATH,
+  MINIMAX_M3_MODEL_PATH,
   isClaudePath,
-  isPremiumPath,
 } from '@/utils/model';
 
 // Model configuration
 interface ModelOption {
   id: string;
   name: string;
-  description: string;
   modelPath: string;
   avatarUrl: string;
   recommended?: boolean;
@@ -50,57 +49,94 @@ const getHfAvatarUrl = (modelId: string) => {
 
 const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
   {
-    id: 'kimi-k2.6',
-    name: 'Kimi K2.6',
-    description: 'Novita',
-    modelPath: 'moonshotai/Kimi-K2.6',
-    avatarUrl: getHfAvatarUrl('moonshotai/Kimi-K2.6'),
-    recommended: true,
-  },
-  {
-    id: 'claude-opus',
-    name: 'Claude Opus 4.6',
-    description: 'Anthropic',
-    modelPath: CLAUDE_MODEL_PATH,
-    avatarUrl: 'https://huggingface.co/api/avatars/Anthropic',
-    recommended: true,
+    id: 'claude-opus-4-8',
+    name: 'Claude Opus 4.8',
+    modelPath: CLAUDE_OPUS_48_MODEL_PATH,
+    avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_48_MODEL_PATH),
   },
   {
     id: 'gpt-5.5',
     name: 'GPT-5.5',
-    description: 'OpenAI',
     modelPath: GPT_55_MODEL_PATH,
-    avatarUrl: 'https://huggingface.co/api/avatars/openai',
+    avatarUrl: getHfAvatarUrl(GPT_55_MODEL_PATH),
   },
   {
-    id: 'minimax-m2.7',
-    name: 'MiniMax M2.7',
-    description: 'Novita',
-    modelPath: 'MiniMaxAI/MiniMax-M2.7',
-    avatarUrl: getHfAvatarUrl('MiniMaxAI/MiniMax-M2.7'),
+    id: 'kimi-k2.7-code',
+    name: 'Kimi K2.7 Code',
+    modelPath: KIMI_K27_CODE_MODEL_PATH,
+    avatarUrl: getHfAvatarUrl(KIMI_K27_CODE_MODEL_PATH),
   },
   {
-    id: 'glm-5.1',
-    name: 'GLM 5.1',
-    description: 'Together',
-    modelPath: 'zai-org/GLM-5.1',
-    avatarUrl: getHfAvatarUrl('zai-org/GLM-5.1'),
+    id: 'minimax-m3',
+    name: 'MiniMax M3',
+    modelPath: MINIMAX_M3_MODEL_PATH,
+    avatarUrl: getHfAvatarUrl(MINIMAX_M3_MODEL_PATH),
   },
   {
+    id: 'glm-5.2',
+    name: 'GLM 5.2',
+    modelPath: GLM_52_MODEL_PATH,
+    avatarUrl: getHfAvatarUrl(GLM_52_MODEL_PATH),
+    recommended: true,
+  },
+  {
+    // Direct DeepSeek provider (uses the user's own DEEPSEEK_API_KEY via the
+    // ``deepseek/`` LiteLLM route in agent/core/llm_params.py), not the HF
+    // Router id. Selectable from the picker; GLM 5.2 remains the default.
     id: 'deepseek-v4-pro',
     name: 'DeepSeek V4 Pro',
-    description: 'DeepInfra',
-    modelPath: 'deepseek-ai/DeepSeek-V4-Pro:deepinfra',
+    modelPath: DEEPSEEK_V4_PRO_DIRECT_PATH,
     avatarUrl: getHfAvatarUrl('deepseek-ai/DeepSeek-V4-Pro'),
   },
 ];
 
+const DEFAULT_MODEL_PATH = GLM_52_MODEL_PATH;
+
+const normalizeModelPath = (path: string | undefined) => (
+  (path ?? '')
+    .toLowerCase()
+    .replace(/^huggingface\//, '')
+    .replace(/claude-opus-4\.(\d)/g, 'claude-opus-4-$1')
+);
+
 const findModelByPath = (path: string, options: ModelOption[]): ModelOption | undefined => {
+  const normalizedPath = normalizeModelPath(path);
+  const matched = options.find((m) => {
+    const normalizedModelPath = normalizeModelPath(m.modelPath);
+    const normalizedId = normalizeModelPath(m.id);
+    return (
+      m.modelPath === path ||
+      normalizedModelPath === normalizedPath ||
+      normalizedPath.includes(normalizedId)
+    );
+  });
+  if (matched) return matched;
   if (isClaudePath(path)) {
     const claude = options.find(isClaudeModel);
     if (claude) return claude;
   }
-  return options.find(m => m.modelPath === path || path?.includes(m.id));
+  return undefined;
+};
+
+const modelOptionId = (modelPath: string) => (
+  normalizeModelPath(modelPath)
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+);
+
+const modelOptionFromApi = (model: {
+  id?: string;
+  label?: string;
+  recommended?: boolean;
+}): ModelOption | null => {
+  if (!model.id) return null;
+  return {
+    id: modelOptionId(model.id),
+    name: model.label ?? model.id,
+    modelPath: model.id,
+    avatarUrl: getHfAvatarUrl(model.id.replace(/^huggingface\//, '')),
+    recommended: Boolean(model.recommended),
+  };
 };
 
 const readApiErrorMessage = async (res: Response, fallback: string): Promise<string> => {
@@ -147,8 +183,6 @@ const DATASET_UPLOAD_ACCEPT = '.csv,.json,.jsonl';
 const DATASET_UPLOAD_EXTENSIONS = new Set(['csv', 'json', 'jsonl']);
 
 const isClaudeModel = (m: ModelOption) => isClaudePath(m.modelPath);
-const isPremiumModel = (m: ModelOption) => isPremiumPath(m.modelPath);
-const firstFreeModel = (options: ModelOption[]) => options.find(m => !isPremiumModel(m)) ?? options[0];
 
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -167,18 +201,13 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(DEFAULT_MODEL_OPTIONS);
   const modelOptionsRef = useRef<ModelOption[]>(DEFAULT_MODEL_OPTIONS);
   const sessionIdRef = useRef<string | undefined>(sessionId);
-  const [selectedModelId, setSelectedModelId] = useState<string>(
-    () => findModelByPath(initialModelPath ?? '', DEFAULT_MODEL_OPTIONS)?.id ?? DEFAULT_MODEL_OPTIONS[0].id,
+  const [selectedModelPath, setSelectedModelPath] = useState<string>(
+    () => (
+      findModelByPath(initialModelPath ?? '', DEFAULT_MODEL_OPTIONS)?.modelPath
+      ?? DEFAULT_MODEL_PATH
+    ),
   );
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
-  const { quota, refresh: refreshQuota } = useUserQuota();
-  // The daily-cap dialog is triggered from two places: (a) a 429 returned
-  // from the chat transport when the user tries to send on a premium model over cap —
-  // surfaced via the agent-store flag — and (b) nothing else right now
-  // (switching models is free). Keeping the open state in the store means
-  // the hook layer can flip it without threading props through.
-  const claudeQuotaExhausted = useAgentStore((s) => s.claudeQuotaExhausted);
-  const setClaudeQuotaExhausted = useAgentStore((s) => s.setClaudeQuotaExhausted);
   const jobsUpgradeRequired = useAgentStore((s) => s.jobsUpgradeRequired);
   const setJobsUpgradeRequired = useAgentStore((s) => s.setJobsUpgradeRequired);
   const updateSessionModel = useSessionStore((s) => s.updateSessionModel);
@@ -189,7 +218,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
   const [uploadedDatasets, setUploadedDatasets] = useState<DatasetUploadResponse[]>([]);
   const [isUploadingDataset, setIsUploadingDataset] = useState(false);
   const [datasetUploadProgress, setDatasetUploadProgress] = useState<number | null>(null);
-  const lastSentRef = useRef<string>('');
 
   useEffect(() => {
     modelOptionsRef.current = modelOptions;
@@ -205,21 +233,15 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (cancelled || !data?.available) return;
-        const claude = data.available.find((m: { provider?: string; id?: string }) => (
-          m.provider === 'anthropic' && m.id
-        ));
-        if (!claude?.id) return;
-
-        const next = DEFAULT_MODEL_OPTIONS.map((option) => (
-          isClaudeModel(option)
-            ? { ...option, modelPath: claude.id, name: claude.label ?? option.name }
-            : option
-        ));
+        const next = data.available
+          .map(modelOptionFromApi)
+          .filter((model: ModelOption | null): model is ModelOption => model !== null);
+        if (!next.length) return;
         modelOptionsRef.current = next;
         setModelOptions(next);
         if (!sessionIdRef.current) {
           const current = data.current ? findModelByPath(data.current, next) : null;
-          if (current) setSelectedModelId(current.id);
+          if (current) setSelectedModelPath(current.modelPath);
         }
       })
       .catch(() => { /* ignore */ });
@@ -237,7 +259,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
         if (cancelled) return;
         if (data?.model) {
           const model = findModelByPath(data.model, modelOptionsRef.current);
-          if (model) setSelectedModelId(model.id);
+          setSelectedModelPath(model?.modelPath ?? data.model);
           updateSessionModel(sessionId, data.model);
         }
       })
@@ -245,7 +267,15 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     return () => { cancelled = true; };
   }, [sessionId, updateSessionModel]);
 
-  const selectedModel = modelOptions.find(m => m.id === selectedModelId) || modelOptions[0];
+  const visibleModelOptions = modelOptions;
+  const selectedModel = (
+    findModelByPath(selectedModelPath, visibleModelOptions)
+    || findModelByPath(selectedModelPath, modelOptions)
+    || visibleModelOptions.find(m => m.recommended)
+    || modelOptions.find(m => m.recommended)
+    || visibleModelOptions[0]
+    || modelOptions[0]
+  );
 
   // Auto-focus the textarea when the session becomes ready
   useEffect(() => {
@@ -256,7 +286,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
 
   const handleSend = useCallback(() => {
     if (input.trim() && !disabled && !isUploadingDataset) {
-      lastSentRef.current = input;
       onSend(input);
       setInput('');
     }
@@ -325,14 +354,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     [sessionId, onDatasetUploaded],
   );
 
-  // When the chat transport reports a premium-model quota 429, restore the typed
-  // text so the user doesn't lose their message.
-  useEffect(() => {
-    if (claudeQuotaExhausted && lastSentRef.current) {
-      setInput(lastSentRef.current);
-    }
-  }, [claudeQuotaExhausted]);
-
   useEffect(() => {
     if (!datasetUploadError) return;
     const timeout = window.setTimeout(() => setDatasetUploadError(null), 7000);
@@ -344,13 +365,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     const timeout = window.setTimeout(() => setDatasetUploadSuccess(null), 5000);
     return () => window.clearTimeout(timeout);
   }, [datasetUploadSuccess]);
-
-  // Refresh the quota display whenever the session changes (user might
-  // have started another tab that spent quota).
-  useEffect(() => {
-    if (sessionId) refreshQuota();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLDivElement>) => {
@@ -379,7 +393,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
         body: JSON.stringify({ model: model.modelPath }),
       });
       if (res.ok) {
-        setSelectedModelId(model.id);
+        setSelectedModelPath(model.modelPath);
         updateSessionModel(sessionId, model.modelPath);
         setModelSwitchError(null);
         return;
@@ -389,48 +403,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
       setModelSwitchError(error instanceof Error ? error.message : 'Could not switch model.');
     }
   };
-
-  // Dialog close: just clear the flag. The typed text is already restored.
-  const handleCapDialogClose = useCallback(() => {
-    setClaudeQuotaExhausted(false);
-  }, [setClaudeQuotaExhausted]);
-
-  // "Use a free model" — switch the current session to Kimi (or the first
-  // non-premium option) and auto-retry the send that tripped the cap.
-  const handleUseFreeModel = useCallback(async () => {
-    setClaudeQuotaExhausted(false);
-    if (!sessionId) return;
-    const free = modelOptions.find(m => m.modelPath === FIRST_FREE_MODEL_PATH)
-      ?? firstFreeModel(modelOptions);
-    try {
-      const res = await apiFetch(`/api/session/${sessionId}/model`, {
-        method: 'POST',
-        body: JSON.stringify({ model: free.modelPath }),
-      });
-      if (res.ok) {
-        setSelectedModelId(free.id);
-        updateSessionModel(sessionId, free.modelPath);
-        const retryText = lastSentRef.current;
-        if (retryText) {
-          onSend(retryText);
-          setInput('');
-          lastSentRef.current = '';
-        }
-      }
-    } catch { /* ignore */ }
-  }, [sessionId, onSend, setClaudeQuotaExhausted, modelOptions, updateSessionModel]);
-
-  const handlePremiumUpgradeClick = useCallback(async () => {
-    if (!sessionId) return;
-    try {
-      await apiFetch(`/api/pro-click/${sessionId}`, {
-        method: 'POST',
-        body: JSON.stringify({ source: 'premium_cap_dialog', target: 'pro_pricing' }),
-      });
-    } catch {
-      /* tracking is best-effort */
-    }
-  }, [sessionId]);
 
   const handleJobsUpgradeClose = useCallback(() => {
     setJobsUpgradeRequired(null);
@@ -472,16 +444,6 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [awaitingTopUp, jobsUpgradeRequired, handleJobsRetry]);
-
-  // Hide the chip until the user has actually burned quota; opening a
-  // premium-model session without sending should not populate a counter.
-  const premiumChip = (() => {
-    if (!quota || quota.premiumUsedToday === 0) return null;
-    if (quota.plan === 'free') {
-      return quota.premiumRemaining > 0 ? 'Free today' : 'Pro only';
-    }
-    return `${quota.premiumUsedToday}/${quota.premiumDailyCap} today`;
-  })();
 
   return (
     <Box
@@ -744,11 +706,11 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
             }
           }}
         >
-          {modelOptions.map((model) => (
+          {visibleModelOptions.map((model) => (
             <MenuItem
               key={model.id}
               onClick={() => handleSelectModel(model)}
-              selected={selectedModelId === model.id}
+              selected={selectedModel.modelPath === model.modelPath}
               sx={{
                 py: 1.5,
                 '&.Mui-selected': {
@@ -780,38 +742,13 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
                         }}
                       />
                     )}
-                    {isPremiumModel(model) && premiumChip && (
-                      <Chip
-                        label={premiumChip}
-                        size="small"
-                        sx={{
-                          height: '18px',
-                          fontSize: '10px',
-                          bgcolor: 'rgba(255,255,255,0.08)',
-                          color: 'var(--muted-text)',
-                          fontWeight: 600,
-                        }}
-                      />
-                    )}
                   </Box>
                 }
-                secondary={model.description}
-                secondaryTypographyProps={{
-                  sx: { fontSize: '12px', color: 'var(--muted-text)' }
-                }}
               />
             </MenuItem>
           ))}
         </Menu>
 
-        <ClaudeCapDialog
-          open={claudeQuotaExhausted}
-          plan={quota?.plan ?? 'free'}
-          cap={quota?.premiumDailyCap ?? 1}
-          onClose={handleCapDialogClose}
-          onUseFreeModel={handleUseFreeModel}
-          onUpgrade={handlePremiumUpgradeClick}
-        />
         <JobsUpgradeDialog
           open={!!jobsUpgradeRequired}
           message={jobsUpgradeRequired?.message || ''}
