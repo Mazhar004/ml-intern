@@ -29,11 +29,13 @@ import YoloControl from '@/components/YoloControl';
 import UsageMeter from '@/components/UsageMeter';
 import { apiFetch } from '@/utils/api';
 import { inferenceCreditCta, isInferenceCreditError } from '@/utils/inferenceBilling';
+import { loadBackendMessages } from '@/lib/backend-message-store';
+import { loadMessages } from '@/lib/chat-message-store';
 
 const DRAWER_WIDTH = 260;
 
 export default function AppLayout() {
-  const { sessions, activeSessionId, markExpired } = useSessionStore();
+  const { sessions, activeSessionId, markExpired, deleteSession } = useSessionStore();
   const { isConnected, llmHealthError, setLlmHealthError, user } = useAgentStore();
   const {
     isLeftSidebarOpen,
@@ -160,13 +162,29 @@ export default function AppLayout() {
 
   const handleSessionDead = useCallback(
     (deadSessionId: string) => {
-      // Backend lost this session — mark it expired so the chat shows a
-      // recovery banner instead of either silently failing or eagerly
-      // creating a new backend session (which would pay a summary-call
-      // cost for sessions the user may never revisit).
-      markExpired(deadSessionId);
+      // Backend lost this session (e.g. after a restart/rebuild). Decide
+      // between "offer recovery" and "drop silently" based on whether there
+      // is anything to recover, so users aren't greeted by a scary
+      // "nothing to restore" banner for an empty, never-persisted session.
+      const hasClientCache =
+        loadBackendMessages(deadSessionId).length > 0 ||
+        loadMessages(deadSessionId).length > 0;
+      if (hasClientCache) {
+        // Real conversation cached in the browser — mark expired so the chat
+        // shows the recovery banner. "Catch me up" restores losslessly from
+        // session_logs/ if present, else summarizes from the cache.
+        markExpired(deadSessionId);
+      } else {
+        // No cached turns: this session never produced recoverable content
+        // (the typical case is the freshly-created session that was active
+        // when the server restarted). Drop the dead row instead of alarming
+        // the user. This only removes the local sidebar entry + (empty)
+        // localStorage caches — it never deletes a session_logs/ file, so any
+        // on-disk session resurfaces via /api/sessions/archived on next load.
+        deleteSession(deadSessionId);
+      }
     },
-    [markExpired],
+    [markExpired, deleteSession],
   );
 
   // Close sidebar on mobile after selecting a session

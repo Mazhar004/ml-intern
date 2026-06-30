@@ -6,6 +6,11 @@ services:
     image: ml-intern:local
     container_name: ml-intern
     restart: unless-stopped
+    # Give the backend time to flush every active session to ./backend/session_logs
+    # during graceful shutdown before Docker SIGKILLs it. The default is 10s; the
+    # final-flush refreshes billing + writes JSON per active session, so allow
+    # generous headroom. Pairs with backend/start.sh forwarding SIGTERM to uvicorn.
+    stop_grace_period: 30s
     ports:
       - "7860:7860"
     env_file:

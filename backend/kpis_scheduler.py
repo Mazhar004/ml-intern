@@ -104,6 +104,12 @@ def start(backfill_hours: int = 6) -> None:
     if os.environ.get("ML_INTERN_KPIS_DISABLED"):
         logger.info("kpis_scheduler: disabled via ML_INTERN_KPIS_DISABLED")
         return
+    # The hourly rollup uploads usage KPIs to the upstream HF dataset repos
+    # (smolagents/ml-intern-*), which a personal/local deployment can neither
+    # populate nor write to. Skip it in local mode so it doesn't fail hourly.
+    if os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in ("1", "true", "yes"):
+        logger.info("kpis_scheduler: disabled in ML_INTERN_LOCAL_MODE")
+        return
     if _scheduler is not None:
         return
 

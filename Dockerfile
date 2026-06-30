@@ -34,6 +34,9 @@ RUN uv sync --no-dev --frozen
 COPY agent/ ./agent/
 COPY backend/ ./backend/
 COPY configs/ ./configs/
+# Ops/analytics scripts (build_kpis.py, sweep_orphan_sandboxes.py, …). The KPI
+# scheduler imports scripts/build_kpis.py at runtime, so it must be in the image.
+COPY scripts/ ./scripts/
 
 # Copy built frontend
 COPY --from=frontend-builder /app/frontend/dist ./static/
