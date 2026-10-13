@@ -13,13 +13,28 @@ import yaml
 from jinja2 import Template
 from litellm import Message, acompletion
 
+from agent.core.model_ids import is_direct_anthropic_model_id
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
     with_prompt_caching,
 )
+from agent.core.thinking_history import (
+    is_internal_nudge,
+    message_field,
+    plain_text_transcript,
+    repair_direct_anthropic_history,
+)
 
 logger = logging.getLogger(__name__)
+
+# Direct Anthropic summaries send the excerpt as one plain-text user turn, so
+# the request never starts with an assistant turn or continues a tool call.
+_SUMMARY_LEAD_IN = (
+    "[SYSTEM: The conversation excerpt to summarize follows as a plain-text "
+    "transcript.]"
+)
+_SUMMARY_TRANSCRIPT_END = "[END OF TRANSCRIPT]"
 
 _HF_WHOAMI_URL = "https://huggingface.co/api/whoami-v2"
 _HF_WHOAMI_TIMEOUT = 5  # seconds
@@ -117,6 +132,45 @@ _RESTORE_PROMPT = (
 )
 
 
+def _direct_anthropic_summary_messages(messages: list[Any], prompt: str) -> list[Any]:
+    """Summary request for the direct Anthropic API: one plain-text user turn.
+
+    The excerpt is cut out of its conversation, so its signed thinking no
+    longer verifies, and it may start with an assistant turn or end inside a
+    tool-use loop. A role-labelled transcript followed by the instruction has
+    none of those problems. System messages are passed through unchanged.
+    """
+    system = [m for m in messages if message_field(m, "role") == "system"]
+    excerpt = [m for m in messages if message_field(m, "role") != "system"]
+    content = "\n\n".join(
+        [
+            _SUMMARY_LEAD_IN,
+            plain_text_transcript(excerpt),
+            _SUMMARY_TRANSCRIPT_END,
+            prompt,
+        ]
+    )
+    return [*system, Message(role="user", content=content)]
+
+
+def _retained_thinking_invalidated(
+    first_user_changed: bool, original: list[Any], retained: list[Any]
+) -> bool:
+    """True when compaction edited a message that signed thinking depends on.
+
+    A signature covers everything up to its assistant turn, so only edits at
+    or before the last retained assistant turn matter.
+    """
+    if first_user_changed:
+        return True
+    last_assistant = max(
+        (i for i, m in enumerate(retained) if message_field(m, "role") == "assistant"),
+        default=-1,
+    )
+    pairs = zip(retained[: last_assistant + 1], original)
+    return any(new is not old for new, old in pairs)
+
+
 async def summarize_messages(
     messages: list[Message],
     model_name: str,
@@ -143,7 +197,10 @@ async def summarize_messages(
     Returns ``(summary_text, completion_tokens)``.
     """
     from agent.core.llm_params import _resolve_llm_params
-    from agent.core.agent_loop import _scrub_reasoning_for_provider
+    from agent.core.agent_loop import (
+        _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS,
+        _scrub_reasoning_for_provider,
+    )
 
     prompt_messages = list(messages) + [Message(role="user", content=prompt)]
     llm_params = _resolve_llm_params(
@@ -155,6 +212,11 @@ async def summarize_messages(
         llm_params,
         session_id=router_session_id_for(session),
     )
+    if is_direct_anthropic_model_id(llm_params.get("model")):
+        # Non-streaming call: cap the budget (always-on thinking spends it
+        # too) and send the excerpt as one plain-text user turn.
+        max_tokens = min(max_tokens, _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS)
+        prompt_messages = _direct_anthropic_summary_messages(messages, prompt)
     llm_params = {**llm_params, "max_completion_tokens": max_tokens}
     # Mirror the scrubbing the main agent loop does. Without this, DeepSeek
     # thinking-mode 400s on a missing reasoning_content during summarize/restore
@@ -337,6 +399,14 @@ class ContextManager:
         if self.on_message_added:
             self.on_message_added(message)
 
+    def replace_items(self, items: list[Message]) -> None:
+        """Swap in a rewritten history (stored as a new list).
+
+        The previous Message objects are left as they were: callers build new
+        objects instead of editing stored ones.
+        """
+        self.items = list(items)
+
     def get_messages(self) -> list[Message]:
         """Get all messages for sending to LLM.
 
@@ -421,39 +491,44 @@ class ContextManager:
     def undo_last_turn(self) -> bool:
         """Remove the last complete turn (user msg + all assistant/tool msgs that follow).
 
-        Pops from the end until the last user message is removed, keeping the
-        tool_use/tool_result pairing valid. Never removes the system message.
+        Removes the last user message the UI shows and everything after it,
+        keeping the tool_use/tool_result pairing valid. Internal "[SYSTEM:"
+        nudges are hidden in the UI, so they are not treated as turn starts.
+        Never removes the system message.
 
         Returns True if a user message was found and removed.
         """
-        if len(self.items) <= 1:
+        user_indices = self._visible_user_indices()
+        if not user_indices:
             return False
-
-        while len(self.items) > 1:
-            msg = self.items.pop()
-            if getattr(msg, "role", None) == "user":
-                return True
-
-        return False
+        self.items = self.items[: user_indices[-1]]
+        return True
 
     def truncate_to_user_message(self, user_message_index: int) -> bool:
         """Truncate history to just before the Nth user message (0-indexed).
 
+        Counts only the user messages the UI shows (internal "[SYSTEM:"
+        nudges are skipped), so the index matches the frontend's.
         Removes that user message and everything after it.
         System message (index 0) is never removed.
 
         Returns True if the target user message was found and removed.
         """
-        count = 0
-        for i, msg in enumerate(self.items):
-            if i == 0:
-                continue  # skip system message
-            if getattr(msg, "role", None) == "user":
-                if count == user_message_index:
-                    self.items = self.items[:i]
-                    return True
-                count += 1
-        return False
+        user_indices = self._visible_user_indices()
+        if not 0 <= user_message_index < len(user_indices):
+            return False
+        self.items = self.items[: user_indices[user_message_index]]
+        return True
+
+    def _visible_user_indices(self) -> list[int]:
+        """Item indices of user messages the UI renders (system msg excluded)."""
+        return [
+            i
+            for i, msg in enumerate(self.items)
+            if i > 0
+            and getattr(msg, "role", None) == "user"
+            and not is_internal_nudge(msg)
+        ]
 
     # Compaction fires at 90% of model_max_tokens so there's headroom for
     # the next turn's prompt + response before we actually hit the ceiling.
@@ -607,15 +682,25 @@ class ContextManager:
         # compaction by being intrinsically too large. Messages in
         # ``messages_to_summarize`` are folded into the summary, so their size
         # doesn't matter on its own.
+        original_first_user, original_recent = first_user_msg, recent_messages
         if first_user_msg is not None:
             truncated = self._truncate_oversized([first_user_msg], model_name)
             first_user_msg = truncated[0]
         recent_messages = self._truncate_oversized(recent_messages, model_name)
+        # Direct Anthropic: signed thinking only survives an unchanged prefix,
+        # so any edit in front of it means a thinking-free, closed-loop copy.
+        direct_anthropic = is_direct_anthropic_model_id(model_name)
 
         # If there's nothing to summarize but the preserved messages are now
         # truncated and small, just rebuild and recompute. This is rare but
         # avoids returning silently with the old (over-threshold) state.
         if not messages_to_summarize:
+            if direct_anthropic and _retained_thinking_invalidated(
+                first_user_msg is not original_first_user,
+                original_recent,
+                recent_messages,
+            ):
+                recent_messages = repair_direct_anthropic_history(recent_messages)
             head = [system_msg] if system_msg else []
             if first_user_msg:
                 head.append(first_user_msg)
@@ -643,6 +728,9 @@ class ContextManager:
             role="assistant",
             content=summary,
         )
+        if direct_anthropic:
+            # The summary replaces the prefix of every retained turn.
+            recent_messages = repair_direct_anthropic_history(recent_messages)
 
         # Reconstruct: system + first user msg + summary + recent messages
         head = [system_msg] if system_msg else []

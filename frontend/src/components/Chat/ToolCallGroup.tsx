@@ -41,10 +41,14 @@ function formatApprovalUsd(value: unknown, fallback = 'Unknown'): string {
   }).format(amount);
 }
 
+// billing_source values from SessionManager._usage_spend_from_response.
+const USAGE_SOURCE_LABELS: ReadonlyMap<unknown, string> = new Map([
+  ['hf_billing_current_session', 'HF billing'],
+  ['hf_billing_plus_direct_provider', 'HF billing + direct API'],
+]);
+
 function usageSourceLabel(source: unknown): string {
-  return source === 'hf_billing_current_session'
-    ? 'HF billing'
-    : 'app telemetry';
+  return USAGE_SOURCE_LABELS.get(source) ?? 'app telemetry';
 }
 
 function numberOrNull(value: unknown): number | null {

@@ -230,3 +230,33 @@ def test_hf_request_token_does_not_use_cached_login(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "get_token", lambda: "cached-token")
 
     assert resolve_hf_request_token(Request()) is None
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [
+        ("high", {"extra_body": {"reasoning_effort": "high"}}),
+        ("max", {"extra_body": {"reasoning_effort": "max"}}),
+        ("medium", {}),
+        (None, {}),
+    ],
+)
+def test_deepseek_direct_params_are_unchanged(monkeypatch, effort, expected):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+
+    params = _resolve_llm_params(
+        "deepseek/deepseek-v4-pro", "session-token", reasoning_effort=effort
+    )
+
+    assert params == {"model": "deepseek/deepseek-v4-pro", **expected}
+
+
+def test_router_claude_does_not_need_anthropic_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    params = _resolve_llm_params(
+        "anthropic/claude-opus-4.8:fal-ai", "session-token", reasoning_effort="high"
+    )
+
+    assert params["model"] == "openai/anthropic/claude-opus-4.8:fal-ai"
+    assert params["api_key"] == "session-token"

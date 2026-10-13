@@ -17,6 +17,7 @@ import {
   type HfAccountUsageBucket,
   type HfInferenceProvidersCredits,
   type UsageBucket,
+  sessionSpendUsd,
   useUsageStore,
 } from '@/store/usageStore';
 
@@ -107,6 +108,7 @@ function AccountUsageSection({
 }) {
   const useJobEstimate =
     !account || (account.hf_jobs_usd <= 0 && (telemetry?.hf_jobs_estimated_usd ?? 0) > 0);
+  const directProviderUsd = telemetry?.direct_provider_inference_usd ?? 0;
 
   return (
     <Box sx={{ py: 1 }}>
@@ -119,6 +121,9 @@ function AccountUsageSection({
           value={account ? formatUsd(account.inference_providers_usd) : 'Unavailable'}
           strong
         />
+        {directProviderUsd > 0 && (
+          <UsageRow label="Direct API (your key)" value={formatUsd(directProviderUsd)} strong />
+        )}
         <UsageRow
           label="HF Jobs"
           value={formatUsd(
@@ -187,14 +192,7 @@ export default function UsageMeter() {
     void fetchUsage(activeSessionId);
   }, [activeSessionId, activeSessionYoloSpend, fetchUsage]);
 
-  const accountSessionInference =
-    usage?.hf_account?.current_session?.inference_providers_usd;
-  const sessionTotal =
-    accountSessionInference == null
-      ? usage?.session?.total_usd
-      : accountSessionInference +
-        (usage?.session?.hf_jobs_estimated_usd ?? 0) +
-        (usage?.session?.sandbox_estimated_usd ?? 0);
+  const sessionTotal = sessionSpendUsd(usage);
   const links = useMemo(() => usage?.links ?? {}, [usage?.links]);
   const billingMessage = billingUnavailableMessage(usage?.hf_account?.error);
   const open = Boolean(anchorEl);

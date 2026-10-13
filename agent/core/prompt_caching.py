@@ -8,14 +8,24 @@ cache writes. OpenAI models cache eligible prefixes automatically and accept
 routing/retention hints in the body.
 Headers like ``X-OpenRouter-Cache`` control response caching, not prompt
 caching through this route.
+
+The direct Anthropic API route (``is_direct_anthropic_model_id``) only uses
+block-level ``cache_control`` breakpoints on outgoing copies: the last tool,
+the system prompt, and the newest tool/user message plus the last one of the
+previous request, so long tool loops keep hitting the cache. Anthropic allows
+at most 4 breakpoints. No HF Router hints (``extra_body``, session header)
+are sent there: LiteLLM's native Anthropic provider would send ``extra_body``
+as a literal body key, and the HF session id doesn't belong at Anthropic.
 """
 
 from typing import Any
 
-from agent.core.model_ids import HF_ROUTER_BASE_URL
+from agent.core.model_ids import HF_ROUTER_BASE_URL, is_direct_anthropic_model_id
 
 _CACHE_CONTROL = {"type": "ephemeral"}
 _CACHEABLE_ROLES = {"system", "user"}
+_DIRECT_ANTHROPIC_MESSAGE_ROLES = {"user", "tool"}
+_ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
 _HF_ROUTER_SESSION_ID_MAX_LENGTH = 256
 HF_ROUTER_SESSION_ID_HEADER = "X-HF-Session-id"
 
@@ -43,6 +53,10 @@ def _is_fal_router_request(llm_params: dict[str, Any]) -> bool:
 def _router_model(llm_params: dict[str, Any]) -> str:
     model = str(llm_params.get("model") or "")
     return model.removeprefix("openai/")
+
+
+def _is_direct_anthropic_request(llm_params: dict[str, Any]) -> bool:
+    return is_direct_anthropic_model_id(str(llm_params.get("model") or ""))
 
 
 def _uses_explicit_cache_control(llm_params: dict[str, Any]) -> bool:
@@ -89,6 +103,10 @@ def with_prompt_cache_params(
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Return LiteLLM params with provider-native prompt-cache body hints."""
+    if _is_direct_anthropic_request(llm_params):
+        # Block-level breakpoints only (``with_prompt_caching``).
+        return llm_params
+
     updates: dict[str, Any] = {}
     headers: dict[str, str] = {}
     if session_id and _is_hf_router_request(llm_params):
@@ -188,6 +206,96 @@ def _tools_with_cache_control(tools: list[dict] | None) -> list[dict] | None:
     return cached_tools
 
 
+def _message_with_cache_control(message: Any) -> dict[str, Any]:
+    cached_message = _message_to_dict(message)
+    cached_message["content"] = _content_with_cache_control(
+        cached_message.get("content")
+    )
+    return cached_message
+
+
+def _direct_anthropic_message_with_cache_control(message: Any) -> dict[str, Any]:
+    if _message_role(message) != "tool":
+        return _message_with_cache_control(message)
+    # LiteLLM moves a tool message's own cache_control onto the Anthropic
+    # tool_result block, so the content can stay as-is.
+    cached_message = _message_to_dict(message)
+    cached_message["cache_control"] = dict(_CACHE_CONTROL)
+    return cached_message
+
+
+def _is_cacheable_message(message: Any, roles: set[str]) -> bool:
+    return _message_role(message) in roles and _has_cacheable_text(
+        _message_content(message)
+    )
+
+
+def _last_index_before(messages: list[Any], end: int, predicate) -> int | None:
+    for idx in range(end - 1, -1, -1):
+        if predicate(messages[idx]):
+            return idx
+    return None
+
+
+def _first_system_index(messages: list[Any]) -> int | None:
+    for idx, message in enumerate(messages):
+        if _message_role(message) == "system":
+            return idx if _has_cacheable_text(_message_content(message)) else None
+    return None
+
+
+def _direct_anthropic_cache_targets(messages: list[Any], budget: int) -> list[int]:
+    """Message indexes to mark, in priority order, capped at ``budget``.
+
+    1. The system prompt (stable prefix).
+    2. The newest user/tool message: writes the cache for this request.
+    3. The last user/tool message before the newest assistant turn, which is
+       where the previous request ended: guarantees a read hit even when a
+       turn added more blocks than Anthropic's 20-block lookback.
+    """
+
+    def is_turn_input(message: Any) -> bool:
+        return _is_cacheable_message(message, _DIRECT_ANTHROPIC_MESSAGE_ROLES)
+
+    def is_assistant(message: Any) -> bool:
+        return _message_role(message) == "assistant"
+
+    targets: list[int] = []
+    system_idx = _first_system_index(messages)
+    if system_idx is not None:
+        targets.append(system_idx)
+
+    newest_idx = _last_index_before(messages, len(messages), is_turn_input)
+    if newest_idx is not None:
+        targets.append(newest_idx)
+        assistant_idx = _last_index_before(messages, newest_idx, is_assistant)
+        if assistant_idx is not None:
+            previous_idx = _last_index_before(messages, assistant_idx, is_turn_input)
+            if previous_idx is not None:
+                targets.append(previous_idx)
+    return targets[:budget]
+
+
+def _with_direct_anthropic_caching(
+    messages: list[Any],
+    tools: list[dict] | None,
+) -> tuple[list[Any], list[dict] | None]:
+    cached_tools = _tools_with_cache_control(tools)
+    tool_breakpoints = 1 if cached_tools else 0
+    targets = _direct_anthropic_cache_targets(
+        messages, _ANTHROPIC_MAX_CACHE_BREAKPOINTS - tool_breakpoints
+    )
+    if not targets:
+        return messages, cached_tools
+
+    cached_messages = list(messages)
+    for idx in targets:
+        cached_messages[idx] = _direct_anthropic_message_with_cache_control(
+            messages[idx]
+        )
+    return cached_messages, cached_tools
+
+
 def with_prompt_caching(
     messages: list[Any],
     tools: list[dict] | None,
@@ -200,7 +308,14 @@ def with_prompt_caching(
     provider-side caching covers the stable prefix without changing persisted
     conversation history. The final tool spec is also marked so stable tool
     definitions are cached.
+
+    Direct Anthropic API models get up to 4 breakpoints instead (see
+    ``_direct_anthropic_cache_targets``). Marked messages are always copies;
+    assistant turns (and their signed thinking blocks) are never touched.
     """
+    if _is_direct_anthropic_request(llm_params):
+        return _with_direct_anthropic_caching(messages, tools)
+
     if not _uses_explicit_cache_control(llm_params):
         return messages, tools
 
@@ -209,11 +324,6 @@ def with_prompt_caching(
     if idx is None:
         return messages, cached_tools
 
-    cached_message = _message_to_dict(messages[idx])
-    cached_message["content"] = _content_with_cache_control(
-        cached_message.get("content")
-    )
-
     cached_messages = list(messages)
-    cached_messages[idx] = cached_message
+    cached_messages[idx] = _message_with_cache_control(messages[idx])
     return cached_messages, cached_tools

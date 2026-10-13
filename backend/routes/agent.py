@@ -55,13 +55,17 @@ from session_manager import (
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token
 from agent.core.local_models import local_model_provider
-from agent.core.llm_params import _resolve_llm_params
+from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
 from agent.core.model_ids import (
     CLAUDE_OPUS_48_MODEL_ID,
+    CLAUDE_OPUS_55_MODEL_ID,
+    CLAUDE_SONNET_55_MODEL_ID,
+    DIRECT_PROVIDER_API_KEY_ENV,
     GLM_52_MODEL_ID,
     GPT_55_MODEL_ID,
     KIMI_K27_CODE_MODEL_ID,
     MINIMAX_M3_MODEL_ID,
+    direct_provider_for,
     strip_huggingface_model_prefix,
 )
 from agent.core.prompt_caching import with_prompt_cache_params
@@ -117,15 +121,23 @@ def _schedule_usage_refresh_and_upload(
 
 
 def _available_models() -> list[dict[str, Any]]:
-    # Curated dropdown for this fork: free HF-routed models plus premium
-    # direct-API options. DeepSeek uses the direct ``deepseek/`` provider
-    # (DEEPSEEK_API_KEY) to match agent/core/llm_params.py routing. The Claude
-    # entry is pinned to the Bedrock id rather than the config default, since
-    # this fork defaults to deepseek/deepseek-v4-pro.
+    # Curated dropdown for this fork: HF Router models plus direct-API options.
+    # Claude Opus 4.8 goes through the HF Router (HF token). Claude Opus/Sonnet
+    # 5.5 call api.anthropic.com with ANTHROPIC_API_KEY, and DeepSeek uses the
+    # direct ``deepseek/`` provider (DEEPSEEK_API_KEY), matching
+    # agent/core/llm_params.py routing. GLM 5.2 stays the default.
     models = [
         {
             "id": CLAUDE_OPUS_48_MODEL_ID,
             "label": "Claude Opus 4.8",
+        },
+        {
+            "id": CLAUDE_OPUS_55_MODEL_ID,
+            "label": "Claude Opus 5.5",
+        },
+        {
+            "id": CLAUDE_SONNET_55_MODEL_ID,
+            "label": "Claude Sonnet 5.5",
         },
         {
             "id": DEFAULT_GPT_MODEL_ID,
@@ -192,8 +204,39 @@ def _user_hf_token(user: dict[str, Any] | None) -> str | None:
 
 
 def _model_requires_hf_router_token(model_id: str | None) -> bool:
+    if direct_provider_for(model_id) is not None:
+        # Direct Anthropic / DeepSeek calls authenticate with their own key.
+        return False
     normalized = strip_huggingface_model_prefix(model_id) or model_id or ""
     return local_model_provider(normalized) is None
+
+
+def _model_label(model_id: str) -> str:
+    return next(
+        (m["label"] for m in AVAILABLE_MODELS if m["id"] == model_id),
+        model_id,
+    )
+
+
+def _require_direct_provider_key(model_id: str | None) -> None:
+    """Reject a direct-provider model whose API key isn't configured.
+
+    Read at request time so the check matches what ``_resolve_llm_params``
+    will see. Only the env var's name is reported, never its value.
+    """
+    provider = direct_provider_for(model_id)
+    if provider is None:
+        return
+    env_name = DIRECT_PROVIDER_API_KEY_ENV[provider]
+    if (os.environ.get(env_name) or "").strip():
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{_model_label(model_id)} needs {env_name} on the server. "
+            "Add it to the repo .env and restart the backend."
+        ),
+    )
 
 
 def _reject_oversize_dataset_upload(request: Request) -> None:
@@ -470,6 +513,7 @@ async def create_session(
 
     # Empty requests use the web default.
     model = _model_override_for_new_session(model)
+    _require_direct_provider_key(model)
 
     try:
         session_id = await session_manager.create_session(
@@ -515,6 +559,7 @@ async def restore_session_summary(
     _validate_model_id(model)
 
     model = _model_override_for_new_session(model)
+    _require_direct_provider_key(model)
 
     try:
         session_id = await session_manager.create_session(
@@ -538,6 +583,8 @@ async def restore_session_summary(
     )
     try:
         summarized = await session_manager.seed_from_summary(session_id, messages)
+    except MissingProviderKeyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
@@ -596,6 +643,7 @@ async def set_session_model(
     if not model_id:
         raise HTTPException(status_code=400, detail="Missing 'model' field")
     _validate_model_id(model_id)
+    _require_direct_provider_key(model_id)
     if not agent_session:
         raise HTTPException(status_code=404, detail="Session not found")
     await session_manager.update_session_model(session_id, model_id)

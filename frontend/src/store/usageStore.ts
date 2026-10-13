@@ -1,11 +1,14 @@
 import { create } from 'zustand';
 import { apiFetch } from '@/utils/api';
 import { useSessionStore } from '@/store/sessionStore';
+import { isDirectProviderPath } from '@/utils/model';
 
 export interface UsageBucket {
   session_id?: string | null;
   total_usd: number;
   inference_usd: number;
+  /** Subset of inference_usd billed to the user's own provider key (Anthropic, DeepSeek). */
+  direct_provider_inference_usd: number;
   hf_jobs_estimated_usd: number;
   sandbox_estimated_usd: number;
   llm_calls: number;
@@ -118,8 +121,15 @@ function applyEventToBucket(
     const cacheCreation = intValue(data.cache_creation_tokens);
     const total =
       intValue(data.total_tokens) || prompt + completion + cacheRead + cacheCreation;
+    const cost = numberValue(data.cost_usd);
     next.llm_calls += 1;
-    next.inference_usd = roundUsd(next.inference_usd + numberValue(data.cost_usd));
+    next.inference_usd = roundUsd(next.inference_usd + cost);
+    // Mirrors aggregate_usage_events in backend/usage.py (direct_provider_for).
+    if (typeof data.model === 'string' && isDirectProviderPath(data.model)) {
+      next.direct_provider_inference_usd = roundUsd(
+        (next.direct_provider_inference_usd ?? 0) + cost,
+      );
+    }
     next.prompt_tokens += prompt;
     next.completion_tokens += completion;
     next.cache_read_tokens += cacheRead;
@@ -140,6 +150,41 @@ function applyEventToBucket(
       (next.sandbox_estimated_usd ?? 0),
   );
   return next;
+}
+
+// Python-style spend coercion from SessionManager._usage_spend_from_response.
+function coerceSpend(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : null;
+}
+
+/**
+ * Session spend in USD, computed exactly like the backend's
+ * SessionManager._usage_spend_from_response (backend/session_manager.py), the
+ * figure usage-threshold and YOLO approvals act on. With HF billing, add the
+ * telemetry estimates HF never sees (direct-provider calls, jobs, sandboxes);
+ * otherwise use the telemetry total, whose inference_usd already includes the
+ * direct-provider cost. Undefined only when nothing is loaded yet.
+ */
+export function sessionSpendUsd(usage: UsageResponse | null | undefined): number | undefined {
+  // Partial: the backend reads total_usd only when inference_providers_usd is absent.
+  const current: Partial<HfAccountUsageBucket> | null | undefined =
+    usage?.hf_account?.current_session;
+  const telemetry = usage?.session;
+  if (current) {
+    const hfSpend = coerceSpend(
+      'inference_providers_usd' in current ? current.inference_providers_usd : current.total_usd,
+    );
+    if (hfSpend != null) {
+      return (
+        hfSpend +
+        (coerceSpend(telemetry?.direct_provider_inference_usd) ?? 0) +
+        (coerceSpend(telemetry?.hf_jobs_estimated_usd) ?? 0) +
+        (coerceSpend(telemetry?.sandbox_estimated_usd) ?? 0)
+      );
+    }
+  }
+  if (!telemetry) return undefined;
+  return coerceSpend(telemetry.total_usd) ?? 0;
 }
 
 export const useUsageStore = create<UsageStore>()((set, get) => ({

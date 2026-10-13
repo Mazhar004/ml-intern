@@ -127,6 +127,7 @@ class UsageBucket(BaseModel):
     session_id: str | None = None
     total_usd: float = 0.0
     inference_usd: float = 0.0
+    direct_provider_inference_usd: float = 0.0
     hf_jobs_estimated_usd: float = 0.0
     sandbox_estimated_usd: float = 0.0
     llm_calls: int = 0

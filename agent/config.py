@@ -54,6 +54,10 @@ class Config(BaseModel):
     # ``Session.model_effective_effort``. Default ``high`` because HF Router
     # accepts low/medium/high generically and provider-specific higher levels
     # should be discovered through explicit probes. ``None`` = thinking off.
+    # Direct Anthropic (Claude Opus/Sonnet 5.5) always thinks: the level goes
+    # out as ``output_config.effort`` (``minimal`` → ``low``), ``None`` means
+    # the model's own default, and ``xhigh``/``max`` clamp to ``high`` because
+    # LiteLLM 1.83 rejects them locally for these models.
     # Valid values: None | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     reasoning_effort: str | None = "high"
     messaging: MessagingConfig = MessagingConfig()

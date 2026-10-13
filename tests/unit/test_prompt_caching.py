@@ -308,3 +308,188 @@ def test_prompt_cache_params_is_noop_for_non_router_model():
     cached_params = with_prompt_cache_params(llm_params, session_id="session-1")
 
     assert cached_params is llm_params
+
+
+# ── Direct Anthropic API (api.anthropic.com) ──────────────────────────────
+
+_EPHEMERAL = {"type": "ephemeral"}
+
+
+def _direct_anthropic_params() -> dict:
+    return {
+        "model": "anthropic/claude-opus-5-5",
+        "api_base": "https://api.anthropic.com",
+        "api_key": "sk-ant-test",
+        "max_tokens": 32000,
+        "output_config": {"effort": "high"},
+    }
+
+
+def _tool_call(call_id: str) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "bash", "arguments": "{}"},
+    }
+
+
+def _cache_markers(messages: list, tools: list | None) -> int:
+    def count(node) -> int:
+        if isinstance(node, dict):
+            return ("cache_control" in node) + sum(count(v) for v in node.values())
+        if isinstance(node, list):
+            return sum(count(v) for v in node)
+        return 0
+
+    as_dicts = [m if isinstance(m, dict) else m.model_dump() for m in messages]
+    return count(as_dicts) + count(tools or [])
+
+
+def test_direct_anthropic_prompt_cache_params_add_no_hf_hints():
+    llm_params = _direct_anthropic_params()
+
+    cached_params = with_prompt_cache_params(llm_params, session_id=BILLING_SESSION_ID)
+
+    assert cached_params == llm_params
+    assert "extra_body" not in cached_params
+    assert "extra_headers" not in cached_params
+    assert "prompt_cache_key" not in cached_params
+    assert "cache_control" not in cached_params
+
+
+def test_direct_anthropic_marks_last_tool_system_and_newest_message():
+    messages = [
+        Message(role="system", content="stable system prompt"),
+        Message(role="user", content="current question"),
+    ]
+    tools = [
+        {"type": "function", "function": {"name": "read"}},
+        {"type": "function", "function": {"name": "write"}},
+    ]
+
+    cached_messages, cached_tools = with_prompt_caching(
+        messages, tools, _direct_anthropic_params()
+    )
+
+    assert cached_tools[-1]["cache_control"] == _EPHEMERAL
+    assert "cache_control" not in cached_tools[0]
+    assert "cache_control" not in tools[-1]
+    assert cached_messages[0]["content"] == [
+        {"type": "text", "text": "stable system prompt", "cache_control": _EPHEMERAL}
+    ]
+    assert cached_messages[1]["content"] == [
+        {"type": "text", "text": "current question", "cache_control": _EPHEMERAL}
+    ]
+    assert messages[0].content == "stable system prompt"
+    assert messages[1].content == "current question"
+
+
+def test_direct_anthropic_tool_loop_marks_newest_and_previous_tool_results():
+    assistant_1 = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [_tool_call("toolu_1")],
+        "thinking_blocks": [{"type": "thinking", "thinking": "", "signature": "S1"}],
+    }
+    assistant_2 = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [_tool_call("toolu_2")],
+        "thinking_blocks": [{"type": "thinking", "thinking": "", "signature": "S2"}],
+    }
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "do the task"},
+        assistant_1,
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "first output"},
+        assistant_2,
+        {"role": "tool", "tool_call_id": "toolu_2", "content": "second output"},
+    ]
+
+    cached_messages, _ = with_prompt_caching(messages, None, _direct_anthropic_params())
+
+    assert cached_messages[1] is messages[1]
+    assert cached_messages[2] is assistant_1
+    assert cached_messages[4] is assistant_2
+    # Tool messages carry the marker at message level; LiteLLM puts it on the
+    # Anthropic tool_result block and the content stays a plain string.
+    assert cached_messages[3] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "content": "first output",
+        "cache_control": _EPHEMERAL,
+    }
+    assert cached_messages[5] == {
+        "role": "tool",
+        "tool_call_id": "toolu_2",
+        "content": "second output",
+        "cache_control": _EPHEMERAL,
+    }
+    assert "cache_control" not in messages[3]
+    assert "cache_control" not in messages[5]
+
+
+def test_direct_anthropic_new_user_turn_also_marks_last_message_of_prior_request():
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "follow-up question"},
+    ]
+
+    cached_messages, _ = with_prompt_caching(messages, None, _direct_anthropic_params())
+
+    assert cached_messages[1]["content"][-1]["cache_control"] == _EPHEMERAL
+    assert cached_messages[2] is messages[2]
+    assert cached_messages[3]["content"][-1]["cache_control"] == _EPHEMERAL
+
+
+def test_direct_anthropic_skips_empty_tool_results():
+    messages = [
+        {"role": "user", "content": "do the task"},
+        {"role": "assistant", "content": None, "tool_calls": [_tool_call("t1")]},
+        {"role": "tool", "tool_call_id": "t1", "content": ""},
+    ]
+
+    cached_messages, _ = with_prompt_caching(messages, None, _direct_anthropic_params())
+
+    assert cached_messages[2] is messages[2]
+    assert cached_messages[0]["content"][-1]["cache_control"] == _EPHEMERAL
+
+
+def test_direct_anthropic_never_exceeds_four_cache_breakpoints():
+    messages = [{"role": "system", "content": "stable system"}]
+    for turn in range(12):
+        messages.append({"role": "user", "content": f"question {turn}"})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_tool_call(f"t{turn}")],
+            }
+        )
+        messages.append(
+            {"role": "tool", "tool_call_id": f"t{turn}", "content": f"out {turn}"}
+        )
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+
+    for history_len in range(1, len(messages) + 1):
+        history = messages[:history_len]
+        cached_messages, cached_tools = with_prompt_caching(
+            history, tools, _direct_anthropic_params()
+        )
+        assert _cache_markers(cached_messages, cached_tools) <= 4
+    assert _cache_markers(messages, tools) == 0
+
+
+def test_direct_anthropic_ignores_router_claude_shape():
+    # The HF Router Claude keeps its own marker placement (newest message
+    # stays dynamic) even though both ids start with "anthropic/".
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "current question"},
+    ]
+
+    cached_messages, _ = with_prompt_caching(messages, None, _anthropic_fal_params())
+
+    assert cached_messages[1] is messages[1]

@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from agent.core.model_ids import is_direct_anthropic_model_id  # noqa: E402
 from agent.core.prompt_caching import (  # noqa: E402
     with_prompt_cache_params,
     with_prompt_caching,
@@ -1288,6 +1289,13 @@ def _temperature_for_params(llm_params: dict[str, Any]) -> float:
     return 0.2
 
 
+def _sampling_params(llm_params: dict[str, Any]) -> dict[str, float]:
+    # Claude 5.5 on the direct Anthropic API rejects any sampling override.
+    if is_direct_anthropic_model_id(llm_params.get("model")):
+        return {}
+    return {"temperature": _temperature_for_params(llm_params)}
+
+
 async def _call_json_llm(
     messages: list[dict[str, str]],
     llm_params: dict[str, Any],
@@ -1309,7 +1317,7 @@ async def _call_json_llm(
         response = await completion_func(
             messages=cached_messages,
             max_completion_tokens=max_completion_tokens,
-            temperature=_temperature_for_params(llm_params),
+            **_sampling_params(llm_params),
             **llm_params,
         )
         content = _response_content(response)

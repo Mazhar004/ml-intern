@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Alert, AlertTitle, Box, Button, Link, Typography } from '@mui/material';
 import { useAgentStore } from '@/store/agentStore';
 import { apiFetch } from '@/utils/api';
-import { inferenceCreditCta, isInferenceCreditError } from '@/utils/inferenceBilling';
+import { creditCtaForModel } from '@/utils/inferenceBilling';
 
 interface ChatErrorBannerProps {
   error: string;
@@ -17,8 +17,7 @@ export default function ChatErrorBanner({ error, sessionId, model, onDismiss }: 
   const [copied, setCopied] = useState(false);
   const [reportedAt, setReportedAt] = useState(() => new Date().toISOString());
   const userPlan = useAgentStore((s) => s.user?.plan);
-  const isCreditError = isInferenceCreditError(error);
-  const creditCta = isCreditError ? inferenceCreditCta(userPlan) : null;
+  const creditCta = creditCtaForModel(model, error, userPlan);
 
   useEffect(() => {
     setReportedAt(new Date().toISOString());
@@ -99,7 +98,7 @@ export default function ChatErrorBanner({ error, sessionId, model, onDismiss }: 
             </>
           )}
         </Typography>
-        {creditCta && (
+        {creditCta?.kind === 'hf' && (
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 1 }}>
             <Button
               component="a"

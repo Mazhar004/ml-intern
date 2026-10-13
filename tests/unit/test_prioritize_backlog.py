@@ -654,6 +654,31 @@ async def test_call_json_llm_uses_temperature_one_for_thinking_params():
     assert calls[0]["temperature"] == 1.0
 
 
+@pytest.mark.asyncio
+async def test_call_json_llm_omits_temperature_for_direct_claude_55():
+    mod = _load()
+    calls = []
+
+    async def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    # Claude 5.5 on the direct Anthropic API rejects non-default sampling.
+    result = await mod._call_json_llm(
+        [{"role": "user", "content": "return json"}],
+        {
+            "model": "anthropic/claude-opus-5-5",
+            "api_base": "https://api.anthropic.com",
+            "output_config": {"effort": "high"},
+        },
+        completion_func=fake_completion,
+        retries=0,
+    )
+
+    assert result == {"ok": True}
+    assert "temperature" not in calls[0]
+
+
 def test_render_markdown_report_from_sample_ranking():
     mod = _load()
     records = [

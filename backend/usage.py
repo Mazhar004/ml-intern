@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from agent.core.model_ids import direct_provider_for
 from agent.core.usage_metrics import summarize_sandbox_lifecycle
 
 USAGE_EVENT_TYPES = (
@@ -150,6 +151,9 @@ def _empty_bucket(
         "session_id": session_id,
         "total_usd": 0.0,
         "inference_usd": 0.0,
+        # Subset of inference_usd billed by a direct provider (Anthropic,
+        # DeepSeek) rather than HF, so HF billing never reports it.
+        "direct_provider_inference_usd": 0.0,
         "hf_jobs_estimated_usd": 0.0,
         "sandbox_estimated_usd": 0.0,
         "llm_calls": 0,
@@ -194,7 +198,11 @@ def aggregate_usage_events(
         data = event.get("data") or {}
         if event_type == "llm_call":
             bucket["llm_calls"] += 1
-            bucket["inference_usd"] += _coerce_float(data.get("cost_usd"))
+            call_cost_usd = _coerce_float(data.get("cost_usd"))
+            bucket["inference_usd"] += call_cost_usd
+            call_model = data.get("model")
+            if isinstance(call_model, str) and direct_provider_for(call_model):
+                bucket["direct_provider_inference_usd"] += call_cost_usd
             prompt_tokens = _coerce_int(data.get("prompt_tokens"))
             completion_tokens = _coerce_int(data.get("completion_tokens"))
             cache_read_tokens = _coerce_int(data.get("cache_read_tokens"))
@@ -226,6 +234,9 @@ def aggregate_usage_events(
     _aggregate_sandbox_usage(events, bucket)
 
     bucket["inference_usd"] = round(bucket["inference_usd"], 6)
+    bucket["direct_provider_inference_usd"] = round(
+        bucket["direct_provider_inference_usd"], 6
+    )
     bucket["hf_jobs_estimated_usd"] = round(bucket["hf_jobs_estimated_usd"], 6)
     bucket["sandbox_estimated_usd"] = round(bucket["sandbox_estimated_usd"], 6)
     bucket["total_usd"] = round(

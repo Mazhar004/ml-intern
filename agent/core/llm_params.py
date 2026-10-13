@@ -17,7 +17,10 @@ from agent.core.local_models import (
     local_model_provider,
 )
 from agent.core.model_ids import (
+    ANTHROPIC_API_BASE_URL,
+    DIRECT_PROVIDER_API_KEY_ENV,
     HF_ROUTER_BASE_URL,
+    is_direct_anthropic_model_id,
     strip_huggingface_model_prefix,
 )
 
@@ -45,6 +48,74 @@ class UnsupportedEffortError(ValueError):
     Raised synchronously before any network call so the probe cascade can
     skip levels the provider can't accept (e.g. ``max`` on HF router).
     """
+
+
+class MissingProviderKeyError(RuntimeError):
+    """A direct-provider model was requested but its API key isn't set.
+
+    Raised before any network call: an empty ``ANTHROPIC_API_KEY`` would
+    otherwise make LiteLLM send an unauthenticated request (opaque 401).
+    """
+
+
+_ANTHROPIC_API_KEY_ENV = DIRECT_PROVIDER_API_KEY_ENV["anthropic"]
+_MISSING_ANTHROPIC_KEY_MESSAGE = (
+    f"Claude via the Anthropic API needs {_ANTHROPIC_API_KEY_ENV}. "
+    "Add it to the repo .env and restart the backend."
+)
+
+# Direct Anthropic (Claude Opus/Sonnet 5.5): thinking is always on, effort
+# goes in ``output_config.effort``. LiteLLM 1.83 rejects ``xhigh`` and ``max``
+# locally for these model names (anthropic/chat/transformation.py), so they
+# are clamped to the ceiling at runtime and skipped by the strict probe.
+_DIRECT_ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high"})
+_DIRECT_ANTHROPIC_CLAMPED_EFFORTS = frozenset({"xhigh", "max"})
+_DIRECT_ANTHROPIC_EFFORT_CEILING = "high"
+# Explicit output budget (thinking + answer). Without it LiteLLM falls back to
+# the model map's 128K, which is too large for non-streaming callers.
+_DIRECT_ANTHROPIC_MAX_TOKENS = 32000
+
+
+def _direct_anthropic_api_key() -> str:
+    api_key = (os.environ.get(_ANTHROPIC_API_KEY_ENV) or "").strip()
+    if not api_key:
+        raise MissingProviderKeyError(_MISSING_ANTHROPIC_KEY_MESSAGE)
+    return api_key
+
+
+def _direct_anthropic_effort_level(reasoning_effort: str, strict: bool) -> str | None:
+    level = _hf_router_effort_level(reasoning_effort)
+    if level in _DIRECT_ANTHROPIC_EFFORTS:
+        return level
+    if strict:
+        raise UnsupportedEffortError(
+            f"Direct Anthropic API (LiteLLM) doesn't accept effort={level!r}"
+        )
+    if level in _DIRECT_ANTHROPIC_CLAMPED_EFFORTS:
+        return _DIRECT_ANTHROPIC_EFFORT_CEILING
+    return None
+
+
+def _resolve_direct_anthropic_params(
+    model_name: str,
+    reasoning_effort: str | None,
+    strict: bool,
+) -> dict:
+    # api_base is explicit so an inherited ANTHROPIC_BASE_URL can't redirect
+    # the key. Never send reasoning_effort (LiteLLM turns it into a rejected
+    # thinking budget), thinking (always on), extra_body (sent literally as a
+    # body key), or sampling params (non-default values are rejected).
+    params: dict = {
+        "model": model_name,
+        "api_base": ANTHROPIC_API_BASE_URL,
+        "api_key": _direct_anthropic_api_key(),
+        "max_tokens": _DIRECT_ANTHROPIC_MAX_TOKENS,
+    }
+    if reasoning_effort:
+        level = _direct_anthropic_effort_level(reasoning_effort, strict)
+        if level is not None:
+            params["output_config"] = {"effort": level}
+    return params
 
 
 def _local_api_base(base_url: str) -> str:
@@ -102,6 +173,22 @@ def _resolve_llm_params(
       to LiteLLM as ``openai/<model>``. These endpoints don't receive
       ``reasoning_effort``.
 
+    • ``deepseek/<model>`` — LiteLLM's native DeepSeek provider with
+      ``DEEPSEEK_API_KEY``. ``high`` / ``max`` go via ``extra_body``.
+
+    • ``anthropic/claude-opus-5-5`` / ``anthropic/claude-sonnet-5-5`` (exact
+      raw ids, see ``is_direct_anthropic_model_id``) — LiteLLM's native
+      Anthropic provider at ``https://api.anthropic.com`` with
+      ``ANTHROPIC_API_KEY``. The id is passed verbatim with an explicit
+      ``api_base``/``api_key`` and ``max_tokens=32000``. Effort becomes
+      ``output_config={"effort": level}``: "minimal" → "low"; low/medium/high
+      pass through; xhigh/max raise ``UnsupportedEffortError`` when strict and
+      clamp to "high" otherwise; no effort → no ``output_config``. Never emits
+      ``reasoning_effort``, ``thinking``, ``extra_body`` or sampling params.
+      An empty key raises ``MissingProviderKeyError``. The HF Router Claude
+      (``anthropic/claude-opus-4.8:fal-ai``) and ``huggingface/``-prefixed
+      ids are NOT direct and fall through to the router.
+
     • Anything else is treated as an HF Router id. We hit the auto-routing
       OpenAI-compatible endpoint at ``https://router.huggingface.co/v1``.
       The id can be bare or carry an HF routing suffix (``:fastest`` /
@@ -146,6 +233,9 @@ def _resolve_llm_params(
             # the model uses its default.
             params["extra_body"] = {"reasoning_effort": reasoning_effort}
         return params
+
+    if is_direct_anthropic_model_id(model_name):
+        return _resolve_direct_anthropic_params(model_name, reasoning_effort, strict)
 
     hf_model = normalized_model
     api_key = _resolve_hf_router_token(session_hf_token)

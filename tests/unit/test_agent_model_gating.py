@@ -18,10 +18,14 @@ from dependencies import INTERNAL_HF_TOKEN_KEY  # noqa: E402
 BILLING_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 
 
-def test_available_models_exclude_sonnet_and_have_no_pro_gate():
+def test_available_models_have_no_pro_gate():
     models = {model["id"]: model for model in agent.AVAILABLE_MODELS}
 
     assert models[agent.CLAUDE_OPUS_48_MODEL_ID]["label"] == "Claude Opus 4.8"
+    assert models[agent.CLAUDE_OPUS_55_MODEL_ID]["label"] == "Claude Opus 5.5"
+    assert models[agent.CLAUDE_SONNET_55_MODEL_ID]["label"] == "Claude Sonnet 5.5"
+    assert "recommended" not in models[agent.CLAUDE_OPUS_55_MODEL_ID]
+    assert "recommended" not in models[agent.CLAUDE_SONNET_55_MODEL_ID]
     assert models[agent.DEFAULT_MODEL_ID]["label"] == "GLM 5.2"
     assert models["moonshotai/Kimi-K2.7-Code:novita"]["label"] == "Kimi K2.7 Code"
     assert models["MiniMaxAI/MiniMax-M3:novita"]["label"] == "MiniMax M3"

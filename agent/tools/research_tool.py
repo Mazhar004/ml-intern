@@ -16,8 +16,11 @@ from litellm import Message, acompletion
 
 from agent.core import telemetry
 from agent.core.doom_loop import check_for_doom_loop
-from agent.core.llm_params import _resolve_llm_params
-from agent.core.model_ids import strip_huggingface_model_prefix
+from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
+from agent.core.model_ids import (
+    is_direct_anthropic_model_id,
+    strip_huggingface_model_prefix,
+)
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
@@ -33,6 +36,10 @@ logger = logging.getLogger(__name__)
 # At MAX, the loop is force-stopped and whatever content exists is returned.
 _RESEARCH_CONTEXT_WARN = 170_000  # 85% of 200k
 _RESEARCH_CONTEXT_MAX = 190_000
+
+# Research calls are non-streaming; on the direct Anthropic API their
+# max_tokens is capped by ``agent_loop._with_non_streaming_max_tokens``.
+_RESEARCH_TIMEOUT_S = 120
 
 # Tools the research agent can use (read-only subset)
 RESEARCH_TOOL_NAMES = {
@@ -71,6 +78,70 @@ async def _research_acompletion(
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
     return await acompletion(**kwargs)
+
+
+def _research_llm_params(llm_params: dict[str, Any]) -> dict[str, Any]:
+    """Non-streaming max_tokens cap for direct Anthropic; else unchanged."""
+    from agent.core.agent_loop import _with_non_streaming_max_tokens
+
+    return _with_non_streaming_max_tokens(llm_params)
+
+
+async def _research_summary_call(
+    *,
+    session: Any,
+    research_model: str,
+    messages: list[Any],
+    tool_specs: list[dict],
+    llm_params: dict[str, Any],
+):
+    """Final "summarize now" call that must not run tools.
+
+    Router models get ``tools=None``. Direct Anthropic keeps the same tools
+    array with ``tool_choice="none"``: dropping it would make LiteLLM inject a
+    dummy tool (modify_params) and change the prefix the signed thinking
+    blocks and the prompt cache were built on.
+    """
+    keep_tools = bool(tool_specs) and is_direct_anthropic_model_id(
+        llm_params.get("model")
+    )
+    cached_messages, cached_tools = with_prompt_caching(
+        messages, tool_specs if keep_tools else None, llm_params
+    )
+    return await _research_acompletion(
+        session=session,
+        research_model=research_model,
+        messages=cached_messages,
+        tools=cached_tools if keep_tools else None,
+        tool_choice="none" if keep_tools else None,
+        llm_params=llm_params,
+        timeout=_RESEARCH_TIMEOUT_S,
+    )
+
+
+def _rebuilt_assistant_message(msg: Any, model: str | None) -> Message:
+    """Rebuild the assistant turn with only the wire-safe fields.
+
+    LiteLLM's raw Message carries `provider_specific_fields` and
+    `reasoning_content`, which the HF router's OpenAI schema rejects if we
+    echo them back in the next request. Direct Anthropic also keeps its
+    signed thinking blocks verbatim (required for the next tool-use request)
+    and uses ``None`` rather than ``""`` for a turn with no text.
+    """
+    if not is_direct_anthropic_model_id(model):
+        return Message(role="assistant", content=msg.content, tool_calls=msg.tool_calls)
+
+    from agent.core.agent_loop import _thinking_blocks_from_message
+
+    kwargs: dict[str, Any] = {
+        "role": "assistant",
+        "content": msg.content or None,
+        "tool_calls": msg.tool_calls,
+    }
+    thinking_blocks = _thinking_blocks_from_message(msg)
+    if thinking_blocks:
+        kwargs["thinking_blocks"] = thinking_blocks
+    return Message(**kwargs)
 
 
 async def _record_research_llm_call(
@@ -271,7 +342,11 @@ RESEARCH_TOOL_SPEC = {
 
 
 def _get_research_model(main_model: str) -> str:
-    """Normalize the main model id for the research sub-call."""
+    """Normalize the main model id for the research sub-call.
+
+    The research call always uses the session's model (direct Anthropic ids
+    included); there is no silent downgrade to a cheaper model.
+    """
     return strip_huggingface_model_prefix(main_model) or main_model
 
 
@@ -304,13 +379,16 @@ async def research_handler(
     # We also haven't probed this sub-call's model so we don't know its ceiling.
     _pref = getattr(session.config, "reasoning_effort", None)
     _capped = "high" if _pref in ("max", "xhigh") else _pref
-    llm_params = _resolve_llm_params(
-        research_model,
-        getattr(session, "hf_token", None),
-        reasoning_effort=_capped,
-    )
+    try:
+        llm_params = _resolve_llm_params(
+            research_model,
+            getattr(session, "hf_token", None),
+            reasoning_effort=_capped,
+        )
+    except MissingProviderKeyError as e:
+        return str(e), False
     llm_params = with_prompt_cache_params(
-        llm_params,
+        _research_llm_params(llm_params),
         session_id=router_session_id_for(session),
     )
 
@@ -390,14 +468,13 @@ async def research_handler(
             )
             try:
                 _t0 = time.monotonic()
-                cached_messages, _ = with_prompt_caching(messages, None, llm_params)
-                response = await _research_acompletion(
+                # No tool use allowed — force a text response.
+                response = await _research_summary_call(
                     session=session,
                     research_model=research_model,
-                    messages=cached_messages,
-                    tools=None,  # no tools — force text response
+                    messages=messages,
+                    tool_specs=tool_specs,
                     llm_params=llm_params,
-                    timeout=120,
                 )
                 # Telemetry is best-effort; a logging blip must never mask a
                 # valid LLM response (the surrounding except would convert it
@@ -449,7 +526,7 @@ async def research_handler(
                 tools=cached_tools,
                 tool_choice="auto",
                 llm_params=llm_params,
-                timeout=120,
+                timeout=_RESEARCH_TIMEOUT_S,
             )
             try:
                 if await _record_research_llm_call(
@@ -480,17 +557,7 @@ async def research_handler(
             return content, True
 
         # Execute tool calls and add results.
-        # Rebuild the assistant message with only the wire-safe fields —
-        # LiteLLM's raw Message carries `provider_specific_fields` and
-        # `reasoning_content`, which the HF router's OpenAI schema rejects
-        # if we echo them back in the next request.
-        messages.append(
-            Message(
-                role="assistant",
-                content=msg.content,
-                tool_calls=msg.tool_calls,
-            )
-        )
+        messages.append(_rebuilt_assistant_message(msg, llm_params.get("model")))
         for tc in msg.tool_calls:
             try:
                 tool_args = json.loads(tc.function.arguments)
@@ -556,14 +623,12 @@ async def research_handler(
     )
     try:
         _t0 = time.monotonic()
-        cached_messages, _ = with_prompt_caching(messages, None, llm_params)
-        response = await _research_acompletion(
+        response = await _research_summary_call(
             session=session,
             research_model=research_model,
-            messages=cached_messages,
-            tools=None,
+            messages=messages,
+            tool_specs=tool_specs,
             llm_params=llm_params,
-            timeout=120,
         )
         try:
             if await _record_research_llm_call(

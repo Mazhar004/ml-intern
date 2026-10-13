@@ -25,12 +25,15 @@ import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import {
   CLAUDE_OPUS_48_MODEL_PATH,
+  CLAUDE_OPUS_55_DIRECT_PATH,
+  CLAUDE_SONNET_55_DIRECT_PATH,
   DEEPSEEK_V4_PRO_DIRECT_PATH,
   GLM_52_MODEL_PATH,
   GPT_55_MODEL_PATH,
   KIMI_K27_CODE_MODEL_PATH,
   MINIMAX_M3_MODEL_PATH,
   isClaudePath,
+  isDirectAnthropicPath,
 } from '@/utils/model';
 
 // Model configuration
@@ -53,6 +56,20 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
     name: 'Claude Opus 4.8',
     modelPath: CLAUDE_OPUS_48_MODEL_PATH,
     avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_48_MODEL_PATH),
+  },
+  {
+    // Direct Anthropic API (the user's own ANTHROPIC_API_KEY via LiteLLM's
+    // native ``anthropic/`` provider), not the HF Router Claude above.
+    id: 'claude-opus-5-5',
+    name: 'Claude Opus 5.5',
+    modelPath: CLAUDE_OPUS_55_DIRECT_PATH,
+    avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_55_DIRECT_PATH),
+  },
+  {
+    id: 'claude-sonnet-5-5',
+    name: 'Claude Sonnet 5.5',
+    modelPath: CLAUDE_SONNET_55_DIRECT_PATH,
+    avatarUrl: getHfAvatarUrl(CLAUDE_SONNET_55_DIRECT_PATH),
   },
   {
     id: 'gpt-5.5',
@@ -96,12 +113,21 @@ const normalizeModelPath = (path: string | undefined) => (
   (path ?? '')
     .toLowerCase()
     .replace(/^huggingface\//, '')
-    .replace(/claude-opus-4\.(\d)/g, 'claude-opus-4-$1')
+    .replace(/claude-(opus|sonnet|haiku)-(\d+)\.(\d+)/g, 'claude-$1-$2-$3')
 );
+
+const claudeFamily = (path: string) => (
+  normalizeModelPath(path).match(/claude-(opus|sonnet|haiku)/)?.[1] ?? null
+);
+
+// Never cross billing routes, whatever the list order: a direct-Anthropic id
+// only matches the direct entries, and HF Router / legacy ids never do.
+const isSameRoute = (a: string, b: string) => isDirectAnthropicPath(a) === isDirectAnthropicPath(b);
 
 const findModelByPath = (path: string, options: ModelOption[]): ModelOption | undefined => {
   const normalizedPath = normalizeModelPath(path);
-  const matched = options.find((m) => {
+  const candidates = options.filter((m) => isSameRoute(m.modelPath, path));
+  const matched = candidates.find((m) => {
     const normalizedModelPath = normalizeModelPath(m.modelPath);
     const normalizedId = normalizeModelPath(m.id);
     return (
@@ -111,11 +137,12 @@ const findModelByPath = (path: string, options: ModelOption[]): ModelOption | un
     );
   });
   if (matched) return matched;
-  if (isClaudePath(path)) {
-    const claude = options.find(isClaudeModel);
-    if (claude) return claude;
-  }
-  return undefined;
+  // Direct ids are exact; other Claude ids fall back to an HF Router Claude,
+  // preferring the same family (opus/sonnet/haiku).
+  if (isDirectAnthropicPath(path) || !isClaudePath(path)) return undefined;
+  const routerClaude = candidates.filter((m) => isClaudePath(m.modelPath));
+  const family = claudeFamily(path);
+  return routerClaude.find((m) => claudeFamily(m.modelPath) === family) ?? routerClaude[0];
 };
 
 const modelOptionId = (modelPath: string) => (
@@ -138,6 +165,15 @@ const modelOptionFromApi = (model: {
     recommended: Boolean(model.recommended),
   };
 };
+
+// A session model missing from the list (e.g. a direct id the backend did not
+// list) is shown by its raw id instead of the recommended model.
+const resolveSelectedModel = (modelPath: string, options: ModelOption[]): ModelOption => (
+  findModelByPath(modelPath, options)
+  || modelOptionFromApi({ id: modelPath })
+  || options.find((m) => m.recommended)
+  || options[0]
+);
 
 const readApiErrorMessage = async (res: Response, fallback: string): Promise<string> => {
   try {
@@ -182,8 +218,6 @@ const MAX_DATASET_UPLOAD_BYTES = 100 * 1024 * 1024;
 const DATASET_UPLOAD_ACCEPT = '.csv,.json,.jsonl';
 const DATASET_UPLOAD_EXTENSIONS = new Set(['csv', 'json', 'jsonl']);
 
-const isClaudeModel = (m: ModelOption) => isClaudePath(m.modelPath);
-
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -204,7 +238,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
   const [selectedModelPath, setSelectedModelPath] = useState<string>(
     () => (
       findModelByPath(initialModelPath ?? '', DEFAULT_MODEL_OPTIONS)?.modelPath
-      ?? DEFAULT_MODEL_PATH
+      ?? (initialModelPath || DEFAULT_MODEL_PATH)
     ),
   );
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
@@ -268,14 +302,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
   }, [sessionId, updateSessionModel]);
 
   const visibleModelOptions = modelOptions;
-  const selectedModel = (
-    findModelByPath(selectedModelPath, visibleModelOptions)
-    || findModelByPath(selectedModelPath, modelOptions)
-    || visibleModelOptions.find(m => m.recommended)
-    || modelOptions.find(m => m.recommended)
-    || visibleModelOptions[0]
-    || modelOptions[0]
-  );
+  const selectedModel = resolveSelectedModel(selectedModelPath, visibleModelOptions);
 
   // Auto-focus the textarea when the session becomes ready
   useEffect(() => {

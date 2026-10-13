@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +31,20 @@ from agent.core.hf_access import (
     HF_PRO_SUBSCRIBE_URL,
     is_inference_billing_error,
 )
-from agent.core.llm_params import _resolve_llm_params
+from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
+from agent.core.model_ids import is_direct_anthropic_model_id
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
     with_prompt_caching,
 )
 from agent.core.session import DEFAULT_SESSION_LOG_DIR, Event, OpType, Session
+from agent.core.thinking_history import (
+    copy_message as _copy_message,
+    message_field as _message_field,
+    repair_direct_anthropic_history,
+    without_thinking_blocks as _without_thinking_state,
+)
 from agent.core.tools import ToolRouter
 from agent.core.usage_thresholds import (
     USAGE_THRESHOLD_TOOL_NAME,
@@ -640,19 +647,63 @@ def _inference_credit_error_message(user_plan: str | None = None) -> str:
     )
 
 
+_ANTHROPIC_AUTH_MESSAGE = (
+    "Anthropic rejected the API key: ANTHROPIC_API_KEY is missing or invalid. "
+    "Set it in the repo .env and restart the backend."
+)
+_ANTHROPIC_BILLING_URL = "https://console.anthropic.com/settings/billing"
+_ANTHROPIC_BILLING_MESSAGE = (
+    "Your Anthropic API credit balance is too low for this request.\n\n"
+    f"Add credits or check your plan in the Anthropic Console: {_ANTHROPIC_BILLING_URL}"
+)
+
+
+def _is_auth_error_text(err_str: str) -> bool:
+    return (
+        "authentication" in err_str
+        or "unauthorized" in err_str
+        or "invalid x-api-key" in err_str
+    )
+
+
+def _is_anthropic_error(error: Exception, model_name: str | None) -> bool:
+    """Prefer LiteLLM's ``llm_provider``; fall back to the session model.
+
+    Router errors carry ``llm_provider == "openai"`` and keep the HF wording
+    even when the session model is direct Anthropic (e.g. a sub-call).
+    """
+    provider = getattr(error, "llm_provider", None)
+    if provider:
+        return provider == "anthropic"
+    return is_direct_anthropic_model_id(model_name)
+
+
+def _anthropic_error_message(error: Exception, err_str: str) -> str | None:
+    if _is_auth_error_text(err_str):
+        return _ANTHROPIC_AUTH_MESSAGE
+    if "credit balance" in err_str or is_inference_billing_error(error):
+        return _ANTHROPIC_BILLING_MESSAGE
+    return None
+
+
 def _friendly_error_message(
     error: Exception,
     *,
     user_plan: str | None = None,
+    model_name: str | None = None,
 ) -> str | None:
     """Return a user-friendly message for known error types, or None to fall back to traceback."""
+    if isinstance(error, MissingProviderKeyError):
+        return str(error)
+
     err_str = str(error).lower()
 
-    if (
-        "authentication" in err_str
-        or "unauthorized" in err_str
-        or "invalid x-api-key" in err_str
-    ):
+    if _is_anthropic_error(error, model_name):
+        anthropic_message = _anthropic_error_message(error, err_str)
+        if anthropic_message is not None:
+            return anthropic_message
+
+    if _is_auth_error_text(err_str):
         return (
             "Authentication failed - your Hugging Face token is missing or invalid.\n\n"
             "To fix this, set HF_TOKEN=hf_... or run `hf auth login`.\n\n"
@@ -797,6 +848,80 @@ class LLMResult:
     # thinking-replay subsystem was removed in favor of strip-on-the-wire, so
     # this single field is all the fork carries for the DeepSeek round-trip.)
     reasoning_content: str | None = None
+    # Signed Anthropic thinking blocks (possibly with EMPTY text). Direct
+    # Anthropic tool loops must echo them back unchanged on the next request.
+    thinking_blocks: list[dict] | None = None
+
+
+def _as_block_dict(block: Any) -> dict | None:
+    if isinstance(block, dict):
+        return dict(block)
+    if hasattr(block, "model_dump"):
+        return block.model_dump()
+    return None
+
+
+def _is_open_thinking_block(block: dict) -> bool:
+    return block.get("type") == "thinking" and not block.get("signature")
+
+
+def _accumulate_thinking_blocks(blocks: list[dict], deltas: Any) -> list[dict]:
+    """Merge one streamed ``delta.thinking_blocks`` list into complete blocks.
+
+    LiteLLM streams a thinking block as text fragments followed by a
+    signature-only fragment, which closes the block. A block with EMPTY text
+    arrives as that signature fragment alone and must still be kept (it has to
+    be echoed back). Redacted blocks arrive whole. ``litellm.stream_chunk_builder``
+    drops signature-only blocks, so this is done by hand. Returns a new list
+    when anything changes; ``blocks`` itself is never modified.
+    """
+    if not deltas:
+        return blocks
+    merged = list(blocks)
+    for delta in deltas or []:
+        item = _as_block_dict(delta)
+        if item is None:
+            continue
+        if item.get("type") == "redacted_thinking":
+            merged.append(item)
+            continue
+        is_open = bool(merged) and _is_open_thinking_block(merged[-1])
+        base = merged[-1] if is_open else {"type": "thinking", "thinking": ""}
+        updated = {
+            **base,
+            "thinking": (base.get("thinking") or "") + (item.get("thinking") or ""),
+            "signature": item.get("signature") or base.get("signature") or "",
+        }
+        if is_open:
+            merged[-1] = updated
+        else:
+            merged.append(updated)
+    return merged
+
+
+def _complete_thinking_blocks(blocks: list[dict]) -> list[dict] | None:
+    """Keep only blocks the provider will accept back: signed or redacted."""
+    complete = [
+        block
+        for block in blocks
+        if block.get("type") == "redacted_thinking" or block.get("signature")
+    ]
+    return complete or None
+
+
+def _thinking_blocks_from_message(message: Any) -> list[dict] | None:
+    """Non-streaming responses carry thinking on the message or its
+    ``provider_specific_fields``."""
+    provider_fields = getattr(message, "provider_specific_fields", None)
+    blocks = getattr(message, "thinking_blocks", None) or (
+        provider_fields.get("thinking_blocks")
+        if isinstance(provider_fields, dict)
+        else None
+    )
+    if not blocks:
+        return None
+    copied = [_as_block_dict(block) for block in blocks]
+    return [block for block in copied if block is not None] or None
 
 
 def _supports_reasoning_echo(model_name: str | None) -> bool:
@@ -810,8 +935,20 @@ def _supports_reasoning_echo(model_name: str | None) -> bool:
     return bool(model_name) and model_name.startswith("deepseek/")
 
 
+def _wire_safe_assistant_message(
+    message: Any, *, deepseek_echo: bool, keep_thinking: bool
+) -> Any:
+    cleaned = message if keep_thinking else _without_thinking_state(message)
+    rc = _message_field(cleaned, "reasoning_content")
+    if deepseek_echo and rc is None:
+        return _copy_message(cleaned, {"reasoning_content": ""})
+    if not deepseek_echo and rc:
+        return _copy_message(cleaned, {"reasoning_content": None})
+    return cleaned
+
+
 def _scrub_reasoning_for_provider(messages: list, model_name: str | None) -> list:
-    """Provider-aware ``reasoning_content`` normalization on outbound messages.
+    """Provider-aware reasoning/thinking normalization on outbound messages.
 
     For DeepSeek (V4 thinking mode), the API enforces a stronger rule than
     "echo what you got": **every** assistant message in a thinking-mode
@@ -822,51 +959,26 @@ def _scrub_reasoning_for_provider(messages: list, model_name: str | None) -> lis
     before sending.
 
     For every other provider (HF Router OpenAI-compat, Anthropic, OpenAI
-    direct), the field is unwanted and we strip it. We shallow-copy each
-    affected message so we don't mutate the stored history (which we keep
-    intact in case the user swaps the model later).
+    direct), the field is unwanted and we strip it.
+
+    Signed Anthropic ``thinking_blocks`` are kept only when the target is the
+    direct Anthropic API; LiteLLM would otherwise post them verbatim into
+    OpenAI-compatible bodies (HF Router incl. router Claude, DeepSeek, local).
+
+    Affected messages are copied so we don't mutate the stored history (which
+    we keep intact in case the user swaps the model later).
     """
     deepseek_echo = _supports_reasoning_echo(model_name)
-    out = []
-    mutated = False
-    for m in messages:
-        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-        if role != "assistant":
-            out.append(m)
-            continue
-        rc = (
-            getattr(m, "reasoning_content", None)
-            if not isinstance(m, dict)
-            else m.get("reasoning_content")
+    keep_thinking = is_direct_anthropic_model_id(model_name)
+    out = [
+        _wire_safe_assistant_message(
+            m, deepseek_echo=deepseek_echo, keep_thinking=keep_thinking
         )
-        if deepseek_echo:
-            if rc is None:
-                try:
-                    cleaned = m.model_copy(update={"reasoning_content": ""})
-                except AttributeError:
-                    cleaned = m
-                    try:
-                        cleaned.reasoning_content = ""
-                    except Exception:
-                        pass
-                out.append(cleaned)
-                mutated = True
-            else:
-                out.append(m)
-        else:
-            if rc:
-                try:
-                    cleaned = m.model_copy(update={"reasoning_content": None})
-                except AttributeError:
-                    cleaned = m
-                    try:
-                        cleaned.reasoning_content = None
-                    except Exception:
-                        pass
-                out.append(cleaned)
-                mutated = True
-            else:
-                out.append(m)
+        if _message_field(m, "role") == "assistant"
+        else m
+        for m in messages
+    ]
+    mutated = any(new is not old for new, old in zip(out, messages))
     return out if mutated else messages
 
 
@@ -898,12 +1010,39 @@ async def _sleep_for_retry_or_cancel(session: Session, delay: float) -> bool:
 
 
 def _is_invalid_thinking_signature_error(exc: Exception) -> bool:
-    """Return True when a provider rejected replayed thinking metadata."""
+    """Return True when a provider rejected replayed thinking metadata.
+
+    Covers "Invalid `signature` in `thinking` block" and the newer wording
+    for signatures "bound to a different conversation" (edited history).
+    """
+    text = str(exc).lower()
+    if "signature" not in text or "thinking" not in text:
+        return False
+    return "invalid" in text or "bound to a different conversation" in text
+
+
+def _is_legacy_thinking_signature_error(exc: Exception) -> bool:
+    """The exact matcher non-direct routes have always used."""
     text = str(exc)
     return (
         "Invalid `signature` in `thinking` block" in text
         or "Invalid signature in thinking block" in text
     )
+
+
+def _is_missing_thinking_block_error(exc: Exception) -> bool:
+    """Anthropic rejected a tool-use continuation that lacks its thinking."""
+    text = str(exc).lower()
+    if "expected `thinking`" in text or "must start with a thinking block" in text:
+        return True
+    return "thinking block" in text and "final" in text
+
+
+def _is_direct_anthropic_thinking_error(exc: Exception) -> bool:
+    """A signature or missing-thinking rejection of the replayed history."""
+    if _is_invalid_thinking_signature_error(exc):
+        return True
+    return _is_missing_thinking_block_error(exc)
 
 
 def _strip_thinking_state_from_messages(messages: list[Any]) -> int:
@@ -967,6 +1106,22 @@ def _strip_thinking_state_from_messages(messages: list[Any]) -> int:
     return stripped
 
 
+_THINKING_HEAL_LOG = (
+    "The inference provider rejected stale thinking signatures; retrying "
+    "without replayed thinking metadata."
+)
+_DIRECT_ANTHROPIC_HEAL_LOG = (
+    "Anthropic rejected the replayed thinking history; retrying once without "
+    "thinking, with any open tool call recorded as text."
+)
+
+
+async def _send_heal_log(session: Session, log: str) -> None:
+    await session.send_event(
+        Event(event_type="tool_log", data={"tool": "system", "log": log})
+    )
+
+
 async def _maybe_heal_invalid_thinking_signature(
     session: Session,
     messages: list[Any],
@@ -974,26 +1129,69 @@ async def _maybe_heal_invalid_thinking_signature(
     *,
     already_healed: bool,
 ) -> bool:
-    if already_healed or not _is_invalid_thinking_signature_error(exc):
+    """Non-direct routes: strip replayed thinking from ``messages`` in place."""
+    if already_healed or not _is_legacy_thinking_signature_error(exc):
         return False
 
     stripped = _strip_thinking_state_from_messages(messages)
     if not stripped:
         return False
 
-    await session.send_event(
-        Event(
-            event_type="tool_log",
-            data={
-                "tool": "system",
-                "log": (
-                    "The inference provider rejected stale thinking signatures; retrying "
-                    "without replayed thinking metadata."
-                ),
-            },
-        )
-    )
+    await _send_heal_log(session, _THINKING_HEAL_LOG)
     return True
+
+
+def _is_same_history(new: list[Any], old: list[Any]) -> bool:
+    return len(new) == len(old) and all(a is b for a, b in zip(new, old))
+
+
+def _healed_direct_anthropic_history(
+    session: Session, history: list[Any]
+) -> list[Any] | None:
+    """Repaired copy of ``history`` to retry with, or None if nothing changes.
+
+    When ``history`` is the session's stored list, the stored items are
+    replaced with the repaired objects; the old objects are never modified.
+    """
+    healed = repair_direct_anthropic_history(history)
+    if _is_same_history(healed, history):
+        return None
+    context_manager = getattr(session, "context_manager", None)
+    if context_manager is not None and context_manager.items is history:
+        context_manager.replace_items(healed)
+    return healed
+
+
+async def _maybe_heal_thinking_history(
+    session: Session,
+    history: list[Any],
+    messages: list[Any],
+    exc: Exception,
+    llm_params: dict,
+    *,
+    already_healed: bool,
+) -> list[Any] | None:
+    """Messages to retry with after a rejected thinking history, else None.
+
+    ``history`` is the caller's (unscrubbed) list, ``messages`` the outbound
+    one. Direct Anthropic targets retry once with a repaired copy of the
+    history (see ``repair_direct_anthropic_history``) on a signature or a
+    missing-thinking 400; other routes keep the in-place signature strip.
+    """
+    if already_healed:
+        return None
+    if not is_direct_anthropic_model_id(llm_params.get("model")):
+        healed = await _maybe_heal_invalid_thinking_signature(
+            session, messages, exc, already_healed=False
+        )
+        return messages if healed else None
+    if not _is_direct_anthropic_thinking_error(exc):
+        return None
+    healed_history = _healed_direct_anthropic_history(session, history)
+    if healed_history is None:
+        return None
+    await _send_heal_log(session, _DIRECT_ANTHROPIC_HEAL_LOG)
+    return healed_history
 
 
 def _assistant_message_from_result(
@@ -1002,13 +1200,27 @@ def _assistant_message_from_result(
     model_name: str | None = None,
     tool_calls: list[ToolCall] | None = None,
 ) -> Message:
-    """Build an assistant history message for HF Router-compatible replay."""
+    """Build an assistant history message for replay on the next request.
+
+    ``model_name`` is the resolved LiteLLM model (``llm_params["model"]``).
+    """
+    direct_anthropic = is_direct_anthropic_model_id(model_name)
+    content = llm_result.content
+    if direct_anthropic and not content:
+        # "" next to thinking_blocks makes LiteLLM insert a placeholder text
+        # block between thinking and tool_use, which edits the signed turn.
+        content = None
     kwargs: dict[str, Any] = {
         "role": "assistant",
-        "content": llm_result.content,
+        "content": content,
     }
     if tool_calls is not None:
         kwargs["tool_calls"] = tool_calls
+    if direct_anthropic and llm_result.thinking_blocks:
+        # Signed thinking must be echoed back unchanged on the next request of
+        # a tool-use loop. _scrub_reasoning_for_provider drops it for any other
+        # target, so a later model switch never leaks it.
+        kwargs["thinking_blocks"] = [dict(b) for b in llm_result.thinking_blocks]
     if _supports_reasoning_echo(model_name):
         # DeepSeek V4 thinking mode requires the prior turn's reasoning_content
         # echoed back on the next request. Persist it on the stored message;
@@ -1016,6 +1228,64 @@ def _assistant_message_from_result(
         if llm_result.reasoning_content:
             kwargs["reasoning_content"] = llm_result.reasoning_content
     return Message(**kwargs)
+
+
+_CLAUDE_REFUSAL_MESSAGE = (
+    "Claude declined this request (refusal stop reason). "
+    "Rephrase the request or switch models to continue."
+)
+_EMPTY_LENGTH_STOP_MESSAGE = (
+    "The model hit its output token limit before writing a reply "
+    "(finish_reason=length). Try again, lower the reasoning effort, or ask "
+    "for a smaller step."
+)
+
+
+def _unproductive_stop_message(
+    llm_result: LLMResult, model_name: str | None
+) -> str | None:
+    """Message for a direct Anthropic turn without usable output, else None.
+
+    LiteLLM maps Anthropic's ``refusal`` stop reason to ``content_filter``.
+    A ``length`` stop with no text and no tool calls means the whole output
+    budget went to thinking. Other routes (HF Router incl. router Claude,
+    DeepSeek, local) always get None and keep their usual stop handling.
+    """
+    if not is_direct_anthropic_model_id(model_name):
+        return None
+    if llm_result.finish_reason == "content_filter":
+        return _CLAUDE_REFUSAL_MESSAGE
+    if (
+        llm_result.finish_reason == "length"
+        and not llm_result.content
+        and not llm_result.tool_calls_acc
+    ):
+        return _EMPTY_LENGTH_STOP_MESSAGE
+    return None
+
+
+# Non-streaming calls to the direct Anthropic API keep max_tokens (shared with
+# always-on thinking) at about 16K; larger values risk HTTP timeouts.
+_DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS = 16_000
+
+
+def _with_non_streaming_max_tokens(llm_params: dict) -> dict:
+    """Cap max_tokens for a non-streaming direct Anthropic call; else unchanged."""
+    if not is_direct_anthropic_model_id(llm_params.get("model")):
+        return llm_params
+    cap = _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS
+    return {**llm_params, "max_tokens": min(llm_params.get("max_tokens") or cap, cap)}
+
+
+def _attempts_exhausted_error(last_error: Exception | None) -> Exception:
+    """Error to raise when a heal used up the final attempt.
+
+    A heal (effort / thinking signature) on the last attempt never gets its
+    retry; surface the provider error instead of returning ``None``.
+    """
+    if last_error is not None:
+        return last_error
+    return RuntimeError("LLM call ended without a response")
 
 
 async def _call_llm_streaming(
@@ -1026,8 +1296,10 @@ async def _call_llm_streaming(
     _healed_thinking_signature = False
     # DeepSeek echo: normalize reasoning_content on outbound history before the
     # request. Prompt-caching is applied per-attempt inside the loop below.
+    history = messages
     messages = _scrub_reasoning_for_provider(messages, llm_params.get("model"))
     t_start = time.monotonic()
+    last_error: Exception | None = None
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         if _session_cancelled(session):
             return LLMResult(
@@ -1038,6 +1310,7 @@ async def _call_llm_streaming(
             )
         full_content = ""
         full_reasoning = ""
+        thinking_acc: list[dict] = []
         tool_calls_acc: dict[int, dict] = {}
         token_count = 0
         finish_reason = None
@@ -1092,6 +1365,11 @@ async def _call_llm_streaming(
                 if rc_delta:
                     full_reasoning += rc_delta
 
+                # Anthropic streams signed thinking via ``delta.thinking_blocks``.
+                thinking_acc = _accumulate_thinking_blocks(
+                    thinking_acc, getattr(delta, "thinking_blocks", None)
+                )
+
                 if delta.tool_calls:
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
@@ -1131,10 +1409,12 @@ async def _call_llm_streaming(
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=full_reasoning or None,
+                thinking_blocks=_complete_thinking_blocks(thinking_acc),
             )
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            last_error = e
             stream_received_output = bool(full_content or tool_calls_acc)
             if full_content:
                 await session.send_event(
@@ -1171,13 +1451,17 @@ async def _call_llm_streaming(
                     )
                 )
                 continue
-            if await _maybe_heal_invalid_thinking_signature(
+            healed_messages = await _maybe_heal_thinking_history(
                 session,
+                history,
                 messages,
                 e,
+                llm_params,
                 already_healed=_healed_thinking_signature,
-            ):
+            )
+            if healed_messages is not None:
                 _healed_thinking_signature = True
+                messages = healed_messages
                 continue
             _delay = _retry_delay_for(e, _llm_attempt)
             if _llm_attempt < _MAX_LLM_RETRIES - 1 and _delay is not None:
@@ -1206,6 +1490,7 @@ async def _call_llm_streaming(
                     )
                 continue
             raise
+    raise _attempts_exhausted_error(last_error)
 
 
 async def _call_llm_non_streaming(
@@ -1213,10 +1498,12 @@ async def _call_llm_non_streaming(
 ) -> LLMResult:
     """Call the LLM without streaming, emit assistant_message at the end."""
     response = None
+    last_error: Exception | None = None
     _healed_effort = False
     _healed_thinking_signature = False
     # DeepSeek echo: normalize reasoning_content on outbound history before the
     # request. Prompt-caching is applied per-attempt inside the loop below.
+    history = messages
     messages = _scrub_reasoning_for_provider(messages, llm_params.get("model"))
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
@@ -1229,7 +1516,7 @@ async def _call_llm_non_streaming(
             )
         try:
             request_llm_params = with_prompt_cache_params(
-                llm_params,
+                _with_non_streaming_max_tokens(llm_params),
                 session_id=router_session_id_for(session),
             )
             cached_messages, cached_tools = with_prompt_caching(
@@ -1247,6 +1534,7 @@ async def _call_llm_non_streaming(
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            last_error = e
             if _is_context_overflow_error(e):
                 raise ContextWindowExceededError(str(e)) from e
             if not _healed_effort and _is_effort_config_error(e):
@@ -1264,13 +1552,17 @@ async def _call_llm_non_streaming(
                     )
                 )
                 continue
-            if await _maybe_heal_invalid_thinking_signature(
+            healed_messages = await _maybe_heal_thinking_history(
                 session,
+                history,
                 messages,
                 e,
+                llm_params,
                 already_healed=_healed_thinking_signature,
-            ):
+            )
+            if healed_messages is not None:
                 _healed_thinking_signature = True
+                messages = healed_messages
                 continue
             _delay = _retry_delay_for(e, _llm_attempt)
             if _llm_attempt < _MAX_LLM_RETRIES - 1 and _delay is not None:
@@ -1300,10 +1592,14 @@ async def _call_llm_non_streaming(
                 continue
             raise
 
+    if response is None:
+        raise _attempts_exhausted_error(last_error)
+
     choice = response.choices[0]
     message = choice.message
     content = message.content or None
     reasoning_content = getattr(message, "reasoning_content", None) or None
+    thinking_blocks = _thinking_blocks_from_message(message)
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0
 
@@ -1341,6 +1637,7 @@ async def _call_llm_non_streaming(
         finish_reason=finish_reason,
         usage=usage,
         reasoning_content=reasoning_content,
+        thinking_blocks=thinking_blocks,
     )
 
 
@@ -1543,6 +1840,31 @@ class Handlers:
                 token_count = llm_result.token_count
                 finish_reason = llm_result.finish_reason
 
+                # Direct Anthropic only: a refusal or an output budget spent
+                # before any reply must not look like an empty successful turn.
+                # Say so and end the turn, without the plan-continuation guard
+                # re-prompting it. Nothing from the turn is stored. Every other
+                # route gets None here and keeps its existing stop handling.
+                stop_message = _unproductive_stop_message(
+                    llm_result, llm_params.get("model")
+                )
+                if stop_message is not None:
+                    if await maybe_pause_yolo_after_spend(
+                        session,
+                        spend_kind="llm_call",
+                        observed_cost_usd=llm_observed_cost_usd,
+                    ):
+                        return final_response
+                    if session.stream:
+                        await session.send_event(
+                            Event(event_type="assistant_stream_end", data={})
+                        )
+                    await session.send_event(
+                        Event(event_type="error", data={"error": stop_message})
+                    )
+                    errored = True
+                    break
+
                 # If output was truncated, all tool call args are garbage.
                 # Inject a system hint so the LLM retries with smaller content.
                 if finish_reason == "length" and tool_calls_acc:
@@ -1568,8 +1890,12 @@ class Handlers:
                         "  • For other tools: reduce the size of your arguments or use bash."
                     )
                     if content:
+                        # The turn's tool calls were dropped, so it no longer
+                        # matches what its thinking signature covers: store it
+                        # as plain text without the thinking blocks.
                         assistant_msg = _assistant_message_from_result(
-                            llm_result, model_name=llm_params.get("model")
+                            replace(llm_result, thinking_blocks=None),
+                            model_name=llm_params.get("model"),
                         )
                         session.context_manager.add_message(assistant_msg, token_count)
                     session.context_manager.add_message(
@@ -1723,8 +2049,9 @@ class Handlers:
                         bad_tools.append(tc)
 
                 # Add assistant message with all tool calls to context.
-                # The helper preserves Anthropic thinking_blocks and DeepSeek
-                # reasoning_content (echoed back next turn) based on the model.
+                # The helper keeps signed thinking_blocks for direct Anthropic
+                # models and reasoning_content for DeepSeek (both echoed back
+                # next turn); every other route stores neither.
                 assistant_msg = _assistant_message_from_result(
                     llm_result,
                     model_name=llm_params.get("model"),
@@ -2025,6 +2352,7 @@ class Handlers:
                 error_msg = _friendly_error_message(
                     e,
                     user_plan=getattr(session, "user_plan", None),
+                    model_name=session.config.model_name,
                 )
                 if error_msg is None:
                     error_msg = str(e) + "\n" + traceback.format_exc()

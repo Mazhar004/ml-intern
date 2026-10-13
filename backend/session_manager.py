@@ -14,6 +14,8 @@ from agent.config import load_config
 from agent.core.agent_loop import process_submission
 from agent.core.model_ids import (
     GLM_52_MODEL_ID,
+    direct_provider_for,
+    is_direct_anthropic_model_id,
     is_known_router_model_id,
     strip_huggingface_model_prefix,
 )
@@ -43,6 +45,10 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_CONFIG_PATH = str(PROJECT_ROOT / "configs" / "frontend_agent_config.json")
 USAGE_WARNING_SPEND_CACHE_TTL_SECONDS = 30.0
 USAGE_BILLING_REFRESH_TIMEOUT_SECONDS = 2.0
+RESTORE_SUMMARY_MAX_TOKENS = 4000
+# Direct Claude always thinks, and thinking spends the same output budget, so
+# the restore summary needs more headroom (about 16K for a non-streaming call).
+DIRECT_ANTHROPIC_RESTORE_SUMMARY_MAX_TOKENS = 16_000
 
 
 # These dataclasses match agent/main.py structure
@@ -265,6 +271,8 @@ class SessionManager:
     def _model_from_saved_metadata(
         model: str | None,
     ) -> str:
+        if direct_provider_for(model) is not None:
+            return model
         normalized = strip_huggingface_model_prefix(model)
         if normalized and is_known_router_model_id(normalized):
             return normalized
@@ -523,13 +531,20 @@ class SessionManager:
                     else current_session.get("total_usd")
                 )
                 if spend is not None:
+                    billing_source = "hf_billing_current_session"
                     if isinstance(session_bucket, dict):
-                        for key in (
-                            "hf_jobs_estimated_usd",
-                            "sandbox_estimated_usd",
-                        ):
+                        # HF billing never sees direct-provider LLM calls, so
+                        # add their telemetry cost like the other estimates
+                        # and label the blended figure as such.
+                        direct_spend = coerce_spend(
+                            session_bucket.get("direct_provider_inference_usd")
+                        )
+                        if direct_spend:
+                            spend += direct_spend
+                            billing_source = "hf_billing_plus_direct_provider"
+                        for key in ("hf_jobs_estimated_usd", "sandbox_estimated_usd"):
                             spend += coerce_spend(session_bucket.get(key)) or 0.0
-                    return spend, "hf_billing_current_session"
+                    return spend, billing_source
 
         if isinstance(session_bucket, dict):
             spend = coerce_spend(session_bucket.get("total_usd"))
@@ -1481,12 +1496,18 @@ class SessionManager:
             tool_specs = agent_session.tool_router.get_tool_specs_for_llm()
         except Exception:
             pass
+        model_name = session.config.model_name
+        max_tokens = (
+            DIRECT_ANTHROPIC_RESTORE_SUMMARY_MAX_TOKENS
+            if is_direct_anthropic_model_id(model_name)
+            else RESTORE_SUMMARY_MAX_TOKENS
+        )
         try:
             summary, _ = await summarize_messages(
                 parsed,
-                model_name=session.config.model_name,
+                model_name=model_name,
                 hf_token=session.hf_token,
-                max_tokens=4000,
+                max_tokens=max_tokens,
                 prompt=_RESTORE_PROMPT,
                 tool_specs=tool_specs,
                 session=session,
