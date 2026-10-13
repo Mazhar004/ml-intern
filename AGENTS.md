@@ -4,6 +4,7 @@
 
 - Frontend: from `frontend/`, run `npm ci` if dependencies are missing, then `npm run dev`.
 - Backend: from `backend/`, run `uv run uvicorn main:app --host ::1 --port 7860`.
+- On this fork, `backend/start.sh` (Docker entrypoint) still runs the full `main:app`. Upstream's `retired_main:app` (retirement page + `GET /api` only) is kept but not started.
 - Frontend URL: http://localhost:5173/
 - Backend health check: `curl -g http://[::1]:7860/api`
 - Frontend proxy health check: `curl http://localhost:5173/api`
