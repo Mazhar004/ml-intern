@@ -546,6 +546,7 @@ class Session:
         project_name: str | None = None
         if self.project_root:
             from pathlib import Path as _Path
+
             try:
                 project_name = _Path(self.project_root).name
             except Exception:

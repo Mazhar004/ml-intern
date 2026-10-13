@@ -173,6 +173,7 @@ def _truncate_output(
 
 # ── Handlers ────────────────────────────────────────────────────────────
 
+
 async def _bash_handler(
     args: dict[str, Any], session: Any = None, **_kw
 ) -> tuple[str, bool]:
@@ -232,7 +233,9 @@ async def _bash_handler(
         return f"bash error: {e}", False
 
 
-async def _read_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
+async def _read_handler(
+    args: dict[str, Any], session: Any = None, **_kw
+) -> tuple[str, bool]:
     file_path = args.get("path", "")
     if not file_path:
         return "No path provided.", False
@@ -264,7 +267,9 @@ async def _read_handler(args: dict[str, Any], session: Any = None, **_kw) -> tup
     return "\n".join(numbered), True
 
 
-async def _write_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
+async def _write_handler(
+    args: dict[str, Any], session: Any = None, **_kw
+) -> tuple[str, bool]:
     file_path = args.get("path", "")
     content = args.get("content", "")
     if not file_path:
@@ -295,7 +300,9 @@ async def _write_handler(args: dict[str, Any], session: Any = None, **_kw) -> tu
         return f"write error: {e}", False
 
 
-async def _edit_handler(args: dict[str, Any], session: Any = None, **_kw) -> tuple[str, bool]:
+async def _edit_handler(
+    args: dict[str, Any], session: Any = None, **_kw
+) -> tuple[str, bool]:
     from agent.tools.edit_utils import apply_edit, validate_python
 
     file_path = args.get("path", "")

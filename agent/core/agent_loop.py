@@ -834,7 +834,11 @@ def _scrub_reasoning_for_provider(messages: list, model_name: str | None) -> lis
         if role != "assistant":
             out.append(m)
             continue
-        rc = getattr(m, "reasoning_content", None) if not isinstance(m, dict) else m.get("reasoning_content")
+        rc = (
+            getattr(m, "reasoning_content", None)
+            if not isinstance(m, dict)
+            else m.get("reasoning_content")
+        )
         if deepseek_echo:
             if rc is None:
                 try:
@@ -1564,7 +1568,9 @@ class Handlers:
                         "  • For other tools: reduce the size of your arguments or use bash."
                     )
                     if content:
-                        assistant_msg = _assistant_message_from_result(llm_result, model_name=llm_params.get("model"))
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_name=llm_params.get("model")
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                     session.context_manager.add_message(
                         Message(role="user", content=f"[SYSTEM: {truncation_hint}]")
@@ -1627,7 +1633,9 @@ class Handlers:
                             _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT,
                         )
                         if content:
-                            assistant_msg = _assistant_message_from_result(llm_result, model_name=llm_params.get("model"))
+                            assistant_msg = _assistant_message_from_result(
+                                llm_result, model_name=llm_params.get("model")
+                            )
                             session.context_manager.add_message(
                                 assistant_msg, token_count
                             )
@@ -1671,7 +1679,9 @@ class Handlers:
                         (content or "")[:500],
                     )
                     if content:
-                        assistant_msg = _assistant_message_from_result(llm_result, model_name=llm_params.get("model"))
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_name=llm_params.get("model")
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                         final_response = content
                     if await maybe_pause_yolo_after_spend(

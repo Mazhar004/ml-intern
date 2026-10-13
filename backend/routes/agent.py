@@ -58,7 +58,6 @@ from agent.core.local_models import local_model_provider
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.model_ids import (
     CLAUDE_OPUS_48_MODEL_ID,
-    DEEPSEEK_V4_PRO_MODEL_ID,
     GLM_52_MODEL_ID,
     GPT_55_MODEL_ID,
     KIMI_K27_CODE_MODEL_ID,
@@ -803,6 +802,7 @@ async def list_projects() -> list[dict]:
     The frontend uses this to populate a project picker in the New Task dialog.
     """
     from pathlib import Path as _Path
+
     # Resolve projects/ relative to repo root (parent of backend/), not the
     # backend cwd. Matches what session_manager.create_session writes to.
     repo_root = _Path(__file__).resolve().parent.parent.parent
@@ -813,14 +813,22 @@ async def list_projects() -> list[dict]:
     for d in sorted(proj_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if not d.is_dir() or d.name.startswith("."):
             continue
-        out.append({
-            "name": d.name,
-            "path": str(d.resolve()),
-            "has_data": (d / "data").exists() and any((d / "data").iterdir()) if (d / "data").is_dir() else False,
-            "has_code": (d / "code").exists() and any((d / "code").iterdir()) if (d / "code").is_dir() else False,
-            "has_models": (d / "models").exists() and any((d / "models").iterdir()) if (d / "models").is_dir() else False,
-            "last_modified": d.stat().st_mtime,
-        })
+        out.append(
+            {
+                "name": d.name,
+                "path": str(d.resolve()),
+                "has_data": (d / "data").exists() and any((d / "data").iterdir())
+                if (d / "data").is_dir()
+                else False,
+                "has_code": (d / "code").exists() and any((d / "code").iterdir())
+                if (d / "code").is_dir()
+                else False,
+                "has_models": (d / "models").exists() and any((d / "models").iterdir())
+                if (d / "models").is_dir()
+                else False,
+                "last_modified": d.stat().st_mtime,
+            }
+        )
     return out
 
 
@@ -857,7 +865,9 @@ async def list_archived_sessions(
     if not log_dir.exists():
         return []
     out: list[dict] = []
-    for f in sorted(log_dir.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for f in sorted(
+        log_dir.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+    ):
         try:
             data = _json.loads(f.read_text())
         except Exception:
@@ -873,7 +883,14 @@ async def list_archived_sessions(
                 isinstance(m, dict)
                 and m.get("role") == "assistant"
                 and (
-                    (m.get("content") and (str(m["content"]).strip() if not isinstance(m.get("content"), list) else any(c for c in m["content"])))
+                    (
+                        m.get("content")
+                        and (
+                            str(m["content"]).strip()
+                            if not isinstance(m.get("content"), list)
+                            else any(c for c in m["content"])
+                        )
+                    )
                     or m.get("tool_calls")
                 )
                 for m in msgs
@@ -884,21 +901,29 @@ async def list_archived_sessions(
         proj = data.get("project") or data.get("project_name")
         if requires_project and not proj:
             continue
-        first_user = next((m for m in msgs if isinstance(m, dict) and m.get("role") == "user"), {})
+        first_user = next(
+            (m for m in msgs if isinstance(m, dict) and m.get("role") == "user"), {}
+        )
         first_user_text = first_user.get("content") or ""
         if isinstance(first_user_text, list):
             first_user_text = " ".join(
-                x.get("text", "") if isinstance(x, dict) else str(x) for x in first_user_text
+                x.get("text", "") if isinstance(x, dict) else str(x)
+                for x in first_user_text
             )
-        out.append({
-            "session_id": data.get("session_id") or f.stem,
-            "filename": f.name,
-            "saved_at": data.get("last_save_time") or data.get("session_end_time"),
-            "model": data.get("model_name"),
-            "project": data.get("project") or data.get("project_name"),  # populated for new sessions
-            "message_count": len(msgs),
-            "first_user_preview": (first_user_text[:200] + "…") if len(first_user_text) > 200 else first_user_text,
-        })
+        out.append(
+            {
+                "session_id": data.get("session_id") or f.stem,
+                "filename": f.name,
+                "saved_at": data.get("last_save_time") or data.get("session_end_time"),
+                "model": data.get("model_name"),
+                "project": data.get("project")
+                or data.get("project_name"),  # populated for new sessions
+                "message_count": len(msgs),
+                "first_user_preview": (first_user_text[:200] + "…")
+                if len(first_user_text) > 200
+                else first_user_text,
+            }
+        )
     return out
 
 
@@ -931,8 +956,12 @@ async def cleanup_dummy_archived_sessions(
         is_dummy = len(msgs) < min_messages
         if not is_dummy:
             has_real_assistant = any(
-                isinstance(m, dict) and m.get("role") == "assistant"
-                and ((m.get("content") and str(m.get("content")).strip()) or m.get("tool_calls"))
+                isinstance(m, dict)
+                and m.get("role") == "assistant"
+                and (
+                    (m.get("content") and str(m.get("content")).strip())
+                    or m.get("tool_calls")
+                )
                 for m in msgs
             )
             is_dummy = not has_real_assistant
@@ -944,7 +973,9 @@ async def cleanup_dummy_archived_sessions(
                 pass
         else:
             kept += 1
-    logger.info(f"cleanup_dummy_archived_sessions: deleted {len(deleted)} files, kept {kept}")
+    logger.info(
+        f"cleanup_dummy_archived_sessions: deleted {len(deleted)} files, kept {kept}"
+    )
     return {"deleted": deleted, "kept": kept}
 
 
@@ -978,7 +1009,9 @@ async def deduplicate_archived_sessions(
             continue
         msgs = data.get("messages") or []
         proj = data.get("project") or data.get("project_name") or "(none)"
-        first_user = next((m for m in msgs if isinstance(m, dict) and m.get("role") == "user"), {})
+        first_user = next(
+            (m for m in msgs if isinstance(m, dict) and m.get("role") == "user"), {}
+        )
         c = first_user.get("content", "") or ""
         if isinstance(c, list):
             c = " ".join(str(x) for x in c)
@@ -1000,7 +1033,9 @@ async def deduplicate_archived_sessions(
                 deleted.append(f.name)
             except Exception:
                 pass
-    logger.info(f"deduplicate_archived_sessions: deleted {len(deleted)}, kept {len(kept)}")
+    logger.info(
+        f"deduplicate_archived_sessions: deleted {len(deleted)}, kept {len(kept)}"
+    )
     return {"deleted": deleted, "kept": kept}
 
 
@@ -1059,7 +1094,10 @@ async def import_session_from_disk(
         # Fall back to filename match in case the user passed a full filename
         matches = list(log_dir.glob(sid_filter)) + list(log_dir.glob(f"*{sid_filter}*"))
     if not matches:
-        raise HTTPException(status_code=404, detail=f"No session log matching '{sid_filter}' in ./session_logs/")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No session log matching '{sid_filter}' in ./session_logs/",
+        )
     # Pick the most recent
     src = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
     try:
@@ -1090,6 +1128,7 @@ async def import_session_from_disk(
     # Seed the new session's context with the saved messages (skip the
     # boilerplate system message — the new session already has its own).
     from litellm import Message as _Message
+
     agent_session = session_manager.sessions.get(new_session_id)
     if agent_session is not None:
         seeded: list[_Message] = []

@@ -36,8 +36,7 @@ async def _flush_session_on_shutdown(sid: str, agent_session, semaphore) -> None
     # system prompt) — flushing those creates 1-msg dummy files that pollute
     # the sidebar and the archived list. Cheap to skip before the semaphore.
     user_messages = sum(
-        1 for m in sess.context_manager.items
-        if getattr(m, "role", None) == "user"
+        1 for m in sess.context_manager.items if getattr(m, "role", None) == "user"
     )
     if user_messages == 0:
         logger.info("Skipping flush of empty session %s on shutdown", sid)

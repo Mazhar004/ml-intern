@@ -1322,7 +1322,11 @@ class SessionManager:
         # this server's process. On a native macOS install this means the
         # agent has direct access to the host's MPS GPU and doesn't incur HF
         # Space costs. Set in .env or shell before starting uvicorn.
-        local_mode = os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in ("1", "true", "yes")
+        local_mode = os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         # Resolve a per-session project root. Each session can be tied to its
         # own folder under ``./projects/<name>/`` so that two sessions can be
@@ -1333,6 +1337,7 @@ class SessionManager:
         project_root: str | None = None
         if project and project.strip():
             from pathlib import Path as _Path
+
             safe_name = project.strip().replace("/", "-").replace("..", "-")
             # Resolve projects/ relative to the repo root (the parent of
             # backend/), not the backend cwd, so the directory matches what
@@ -2016,6 +2021,7 @@ class SessionManager:
         proot = getattr(agent_session.session, "project_root", None)
         if proot:
             from pathlib import Path as _Path
+
             project_name = _Path(proot).name
 
         return {
