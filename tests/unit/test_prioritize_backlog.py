@@ -596,7 +596,18 @@ async def test_async_main_fails_early_when_issue_publish_token_missing(monkeypat
 
     monkeypatch.setattr(mod, "collect_sources", fail_collect)
 
-    result = await mod.async_main(["--create-github-issue"])
+    # --model skips load_config(), whose load_dotenv() would restore
+    # GITHUB_TOKEN from a local .env; --hf-token keeps a real token out of
+    # the failure output if this check ever regresses.
+    result = await mod.async_main(
+        [
+            "--create-github-issue",
+            "--model",
+            "test-model",
+            "--hf-token",
+            "hf_test_dummy",
+        ]
+    )
 
     assert result == 1
 
