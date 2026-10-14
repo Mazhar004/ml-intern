@@ -522,8 +522,20 @@ def _is_context_overflow_error(error: Exception) -> bool:
     return any(pattern in err_str for pattern in overflow_patterns)
 
 
+def _is_anthropic_bad_request(error: Exception) -> bool:
+    """Anthropic 400s (invalid requests, or LiteLLM failing to build the
+    request locally) fail the same way on every retry. Their text can echo the
+    conversation, so substring checks like "timeout" must not see them."""
+    return (
+        getattr(error, "llm_provider", None) == "anthropic"
+        and getattr(error, "status_code", None) == 400
+    )
+
+
 def _retry_delay_for(error: Exception, attempt_index: int) -> int | None:
     """Return the delay for this retry attempt, or None if it should not retry."""
+    if _is_anthropic_bad_request(error):
+        return None
     if _is_rate_limit_error(error):
         schedule = _LLM_RATE_LIMIT_RETRY_DELAYS
     elif _is_transient_error(error):
@@ -538,6 +550,8 @@ def _retry_delay_for(error: Exception, attempt_index: int) -> int | None:
 
 def _is_transient_error(error: Exception) -> bool:
     """Return True for errors that are likely transient and worth retrying."""
+    if _is_anthropic_bad_request(error):
+        return False
     err_str = str(error).lower()
     transient_patterns = [
         "timeout",
@@ -678,11 +692,45 @@ def _is_anthropic_error(error: Exception, model_name: str | None) -> bool:
     return is_direct_anthropic_model_id(model_name)
 
 
+# LiteLLM appends the whole request to some local errors ("Received
+# Messages=[...]"). That echo is arbitrary conversation text (it may mention
+# HF 402s or "authentication"), so classification only reads what precedes it.
+_LITELLM_REQUEST_ECHO_MARKER = "received messages="
+
+
+def _error_head(err_str: str) -> str:
+    return err_str.partition(_LITELLM_REQUEST_ECHO_MARKER)[0]
+
+
+def _is_anthropic_billing_error(error: Exception, head: str) -> bool:
+    """Anthropic reports billing as a 402 ``billing_error`` or a 400 saying the
+    credit balance is too low. HF's broader matcher (any "402" in the text) is
+    deliberately not used: it fires on echoed conversation content."""
+    return (
+        getattr(error, "status_code", None) == 402
+        or "billing_error" in head
+        or "credit balance" in head
+    )
+
+
 def _anthropic_error_message(error: Exception, err_str: str) -> str | None:
-    if _is_auth_error_text(err_str):
+    head = _error_head(err_str)
+    if _is_auth_error_text(head):
         return _ANTHROPIC_AUTH_MESSAGE
-    if "credit balance" in err_str or is_inference_billing_error(error):
+    if _is_anthropic_billing_error(error, head):
         return _ANTHROPIC_BILLING_MESSAGE
+    return None
+
+
+def _model_not_found_message(err_str: str) -> str | None:
+    if "model_not_found" in err_str or (
+        "model" in err_str and ("not found" in err_str or "does not exist" in err_str)
+    ):
+        return (
+            "Model not found. Use '/model' to list suggestions, or paste an "
+            "HF model id like 'MiniMaxAI/MiniMax-M3:novita'. Availability is shown "
+            "when you switch."
+        )
     return None
 
 
@@ -699,9 +747,10 @@ def _friendly_error_message(
     err_str = str(error).lower()
 
     if _is_anthropic_error(error, model_name):
-        anthropic_message = _anthropic_error_message(error, err_str)
-        if anthropic_message is not None:
-            return anthropic_message
+        # Never fall through to the HF token / HF credits wording below.
+        return _anthropic_error_message(error, err_str) or _model_not_found_message(
+            _error_head(err_str)
+        )
 
     if _is_auth_error_text(err_str):
         return (
@@ -722,16 +771,7 @@ def _friendly_error_message(
             "which models."
         )
 
-    if "model_not_found" in err_str or (
-        "model" in err_str and ("not found" in err_str or "does not exist" in err_str)
-    ):
-        return (
-            "Model not found. Use '/model' to list suggestions, or paste an "
-            "HF model id like 'MiniMaxAI/MiniMax-M3:novita'. Availability is shown "
-            "when you switch."
-        )
-
-    return None
+    return _model_not_found_message(err_str)
 
 
 async def _compact_and_notify(session: Session) -> None:
@@ -935,10 +975,57 @@ def _supports_reasoning_echo(model_name: str | None) -> bool:
     return bool(model_name) and model_name.startswith("deepseek/")
 
 
+# A stored tool call whose arguments aren't a JSON object (e.g. corrupted by
+# an older redactor in a saved session) makes LiteLLM's Anthropic adapter raise
+# before anything is sent. The raw text is wrapped so the turn stays replayable.
+_UNPARSED_ARGUMENTS_KEY = "_unparsed_arguments"
+
+
+def _anthropic_safe_arguments(arguments: Any) -> str | None:
+    """Replacement arguments for a direct-Anthropic replay, or None if fine."""
+    if not isinstance(arguments, str) or not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return None
+    return json.dumps({_UNPARSED_ARGUMENTS_KEY: arguments})
+
+
+def _tool_call_with_arguments(tool_call: Any, arguments: str) -> Any:
+    if isinstance(tool_call, dict):
+        function = {**(tool_call.get("function") or {}), "arguments": arguments}
+        return {**tool_call, "function": function}
+    function = tool_call.function.model_copy(update={"arguments": arguments})
+    return tool_call.model_copy(update={"function": function})
+
+
+def _with_anthropic_safe_tool_arguments(message: Any) -> Any:
+    tool_calls = _message_field(message, "tool_calls") or []
+    safe_calls = []
+    for tool_call in tool_calls:
+        function = _message_field(tool_call, "function")
+        arguments = _anthropic_safe_arguments(_message_field(function, "arguments"))
+        safe_calls.append(
+            tool_call
+            if arguments is None
+            else _tool_call_with_arguments(tool_call, arguments)
+        )
+    if all(new is old for new, old in zip(safe_calls, tool_calls)):
+        return message
+    return _copy_message(message, {"tool_calls": safe_calls})
+
+
 def _wire_safe_assistant_message(
     message: Any, *, deepseek_echo: bool, keep_thinking: bool
 ) -> Any:
-    cleaned = message if keep_thinking else _without_thinking_state(message)
+    # keep_thinking is True exactly for direct-Anthropic targets.
+    if keep_thinking:
+        cleaned = _with_anthropic_safe_tool_arguments(message)
+    else:
+        cleaned = _without_thinking_state(message)
     rc = _message_field(cleaned, "reasoning_content")
     if deepseek_echo and rc is None:
         return _copy_message(cleaned, {"reasoning_content": ""})

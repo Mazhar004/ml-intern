@@ -33,10 +33,12 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
 
 # Env-var-like exports: we scrub the value but keep the name so callers can
 # still see which secret was referenced. Covers `KEY=value` and `KEY: value`
-# when the key looks secret-y.
+# when the key looks secret-y. The value stops at a backslash: tool-call
+# arguments are JSON strings, and eating the `\` of an escaped quote (as in
+# `api_key=os.environ[\"HF_TOKEN\"]`) would leave the JSON unparseable.
 _SECRETY_NAMES = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|API_KEY|SECRET|PASSWORD|ACCESS_KEY_ID))"
-    r"\s*[:=]\s*([^\s\"']+)"
+    r"\s*[:=]\s*([^\s\"'\\]+)"
 )
 
 

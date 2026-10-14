@@ -1664,3 +1664,198 @@ async def test_research_reports_missing_anthropic_key_as_tool_error(monkeypatch)
     )
 
     assert (output, ok) == (MISSING_KEY_MESSAGE, False)
+
+
+# ── corrupted tool-call arguments in saved history ─────────────────────
+
+# What an older redactor left behind in saved sessions: the escape before
+# the quote after `[REDACTED]` was eaten, so the JSON string ends early.
+CORRUPTED_WRITE_ARGS = (
+    '{"path": "gen.py", "content": "client = InferenceClient('
+    'api_key=[REDACTED]"HF_TOKEN\\"], timeout=180)\\n"}'
+)
+
+
+def _write_call(arguments: str) -> ChatCompletionMessageToolCall:
+    return ChatCompletionMessageToolCall(
+        id="toolu_w",
+        type="function",
+        function={"name": "write", "arguments": arguments},
+    )
+
+
+def _history_with_tool_arguments(arguments: str) -> list[Message]:
+    return [
+        Message(role="user", content="write the generator"),
+        Message(role="assistant", content=None, tool_calls=[_write_call(arguments)]),
+        Message(
+            role="tool", content="wrote gen.py", tool_call_id="toolu_w", name="write"
+        ),
+        Message(role="assistant", content="Done."),
+    ]
+
+
+def test_corrupted_arguments_fixture_is_not_json():
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(CORRUPTED_WRITE_ARGS)
+
+
+def test_scrub_for_direct_anthropic_wraps_unparseable_tool_arguments():
+    history = _history_with_tool_arguments(CORRUPTED_WRITE_ARGS)
+
+    outgoing = _scrub_reasoning_for_provider(history, DIRECT_MODEL)
+
+    sent = outgoing[1].tool_calls[0]
+    assert json.loads(sent.function.arguments) == {
+        "_unparsed_arguments": CORRUPTED_WRITE_ARGS
+    }
+    assert sent.id == "toolu_w"
+    assert sent.function.name == "write"
+    assert history[1].tool_calls[0].function.arguments == CORRUPTED_WRITE_ARGS
+
+
+@pytest.mark.parametrize("arguments", ['{"path": "gen.py"}', ""])
+def test_scrub_for_direct_anthropic_leaves_parseable_or_empty_arguments(arguments):
+    history = _history_with_tool_arguments(arguments)
+
+    outgoing = _scrub_reasoning_for_provider(history, DIRECT_MODEL)
+
+    assert outgoing[1].tool_calls[0].function.arguments == arguments
+
+
+def test_scrub_wraps_non_object_json_arguments_for_direct_anthropic():
+    history = _history_with_tool_arguments('["not", "an", "object"]')
+
+    outgoing = _scrub_reasoning_for_provider(history, DIRECT_MODEL)
+
+    assert json.loads(outgoing[1].tool_calls[0].function.arguments) == {
+        "_unparsed_arguments": '["not", "an", "object"]'
+    }
+
+
+def test_scrub_for_dict_tool_calls_wraps_unparseable_arguments():
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_w",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": CORRUPTED_WRITE_ARGS},
+                }
+            ],
+        },
+    ]
+
+    outgoing = _scrub_reasoning_for_provider(history, DIRECT_MODEL)
+
+    sent = outgoing[1]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(sent) == {"_unparsed_arguments": CORRUPTED_WRITE_ARGS}
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == CORRUPTED_WRITE_ARGS
+
+
+@pytest.mark.parametrize(
+    "model_name", [ROUTER_LITELLM_MODEL, "deepseek/deepseek-v4-pro"]
+)
+def test_scrub_for_non_direct_targets_keeps_corrupted_arguments_as_is(model_name):
+    history = _history_with_tool_arguments(CORRUPTED_WRITE_ARGS)
+
+    outgoing = _scrub_reasoning_for_provider(history, model_name)
+
+    assert outgoing[1].tool_calls[0].function.arguments == CORRUPTED_WRITE_ARGS
+
+
+async def test_direct_turn_on_history_with_corrupted_tool_arguments_reaches_anthropic(
+    anthropic_env, provider_http, monkeypatch
+):
+    monkeypatch.setattr(agent_loop, "_LLM_RETRY_DELAYS", [])
+    session = _make_session()
+    cm = session.context_manager
+    cm.items = [cm.items[0], *_history_with_tool_arguments(CORRUPTED_WRITE_ARGS)]
+    provider_http.queue_anthropic_sse(
+        _anthropic_stream([_text_block("Continuing.")], "end_turn")
+    )
+
+    final = await Handlers.run_agent(session, "continue")
+
+    assert final == "Continuing."
+    body = provider_http.bodies_for("api.anthropic.com")[0]
+    tool_use = body["messages"][1]["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["input"] == {"_unparsed_arguments": CORRUPTED_WRITE_ARGS}
+    assert cm.items[2].tool_calls[0].function.arguments == CORRUPTED_WRITE_ARGS
+
+
+# ── classifying errors that echo the request ───────────────────────────
+
+# LiteLLM appends the whole request to some local errors. That echo holds
+# arbitrary conversation text, so it must not drive error classification.
+_ECHOED_REQUEST = (
+    " Received Messages=[{'content': 'the HF call failed with 402 Payment "
+    "Required; credit balance is too low; authentication; rate limit; "
+    "timeout=180; 500 internal server error', 'role': 'user'}]"
+)
+
+
+def _anthropic_local_conversion_error():
+    import litellm
+
+    return litellm.BadRequestError(
+        message=(
+            "AnthropicException - Failed to parse tool call arguments for tool "
+            "'write' (Anthropic tool invoke). Error: Expecting ',' delimiter: "
+            'line 1 column 70 (char 69). Arguments: {"path": "gen.py"}'
+            + _ECHOED_REQUEST
+        ),
+        model="claude-opus-5-5",
+        llm_provider="anthropic",
+    )
+
+
+def test_anthropic_bad_request_echoing_the_request_is_not_retried():
+    error = _anthropic_local_conversion_error()
+
+    assert agent_loop._is_transient_error(error) is False
+    assert agent_loop._retry_delay_for(error, 0) is None
+
+
+def test_anthropic_bad_request_echo_is_not_called_a_credit_or_key_problem():
+    error = _anthropic_local_conversion_error()
+
+    message = _friendly_error_message(error, user_plan="free", model_name=DIRECT_MODEL)
+
+    assert message is None
+
+
+def test_anthropic_overloaded_error_is_still_retried():
+    import litellm
+
+    error = litellm.InternalServerError(
+        message='AnthropicException - {"type":"error","error":{"type":'
+        '"overloaded_error","message":"Overloaded"}}',
+        model="claude-opus-5-5",
+        llm_provider="anthropic",
+    )
+
+    assert agent_loop._is_transient_error(error) is True
+
+
+def test_anthropic_402_billing_error_uses_anthropic_billing_message():
+    error = _provider_error(
+        'litellm.APIError: AnthropicException - {"type":"error","error":'
+        '{"type":"billing_error","message":"Payment method declined"}}',
+        "anthropic",
+    )
+
+    message = _friendly_error_message(error, model_name=DIRECT_MODEL)
+
+    assert message is not None
+    assert "Anthropic Console" in message
+
+
+def test_router_error_text_with_timeout_keeps_transient_retry():
+    error = _provider_error("upstream request timeout", "openai")
+
+    assert agent_loop._is_transient_error(error) is True

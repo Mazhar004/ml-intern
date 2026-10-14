@@ -1,5 +1,7 @@
 """Tests for the secret scrubber used before session upload."""
 
+import json
+
 from agent.core.redact import scrub, scrub_string
 
 
@@ -74,3 +76,26 @@ def test_scrub_preserves_non_strings():
     assert scrub(None) is None
     assert scrub(123) == 123
     assert scrub(True) is True
+
+
+def test_scrub_keeps_json_encoded_tool_arguments_parseable():
+    # Saved sessions store tool-call arguments as JSON strings. Redacting
+    # `api_key=os.environ[\"HF_TOKEN\"]` must not eat the escape backslash,
+    # or the arguments stop being JSON and Anthropic replays fail.
+    code = 'client = InferenceClient(api_key=os.environ["HF_TOKEN"], timeout=180)\n'
+    arguments = json.dumps({"path": "gen.py", "content": code})
+
+    out = scrub_string(arguments)
+
+    decoded = json.loads(out)
+    assert decoded["path"] == "gen.py"
+    assert decoded["content"].startswith("client = InferenceClient(api_key=[REDACTED]")
+
+
+def test_scrub_redacts_secret_assignment_inside_json_string():
+    arguments = json.dumps({"command": "export API_KEY=supersecretvalue123 && run"})
+
+    out = scrub_string(arguments)
+
+    assert "supersecretvalue123" not in out
+    assert json.loads(out)["command"] == "export API_KEY=[REDACTED] && run"
