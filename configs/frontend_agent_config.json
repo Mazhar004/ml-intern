@@ -1,5 +1,5 @@
 {
-  "model_name": "${ML_INTERN_DEFAULT_MODEL_ID:-zai-org/GLM-5.2:novita}",
+  "model_name": "${ML_INTERN_DEFAULT_MODEL_ID:-anthropic/claude-opus-5-5}",
   "save_sessions": true,
   "session_dataset_repo": "smolagents/ml-intern-sessions",
   "share_traces": true,

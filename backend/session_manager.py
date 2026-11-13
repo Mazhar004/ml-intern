@@ -13,7 +13,6 @@ from typing import Any, Optional
 from agent.config import load_config
 from agent.core.agent_loop import process_submission
 from agent.core.model_ids import (
-    GLM_52_MODEL_ID,
     direct_provider_for,
     is_direct_anthropic_model_id,
     is_known_router_model_id,
@@ -39,6 +38,7 @@ from agent.core.yolo_budget import (
     yolo_budget_pending_to_tool,
 )
 from agent.messaging.gateway import NotificationGateway
+from agent.core.web_models import resolve_default_model_id
 
 # Get project root (parent of backend directory)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -277,7 +277,7 @@ class SessionManager:
         if normalized and is_known_router_model_id(normalized):
             return normalized
 
-        fallback_model = GLM_52_MODEL_ID
+        fallback_model = resolve_default_model_id()
         logger.warning(
             "Saved session model %r failed validation; using %r",
             model,
@@ -1145,7 +1145,7 @@ class SessionManager:
         from litellm import Message
 
         model = self._model_from_saved_metadata(
-            meta.get("model") or self.config.model_name,
+            meta.get("model") or resolve_default_model_id(),
         )
         event_queue: asyncio.Queue = asyncio.Queue()
         submission_queue: asyncio.Queue = asyncio.Queue()
@@ -1291,8 +1291,8 @@ class SessionManager:
             hf_token: The user's HF OAuth token, stored for tool execution.
             user_plan: The active HF account plan used for plan-aware agent CTAs.
             model: Optional model override. When set, replaces ``model_name``
-                on the per-session config clone. None falls back to the
-                config default.
+                on the per-session config clone. None falls back to the web
+                default (``agent.core.web_models.resolve_default_model_id``).
 
         Raises:
             SessionCapacityError: If the server or user has reached the
@@ -1383,7 +1383,7 @@ class SessionManager:
                 hf_username=hf_username,
                 hf_token=hf_token,
                 user_plan=user_plan,
-                model=model,
+                model=model or resolve_default_model_id(),
                 event_queue=event_queue,
                 local_mode=local_mode,
                 project_root=project_root,

@@ -24,13 +24,25 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 from huggingface_hub.errors import HfHubHTTPError
-from litellm import Message, acompletion
+from litellm import (
+    AuthenticationError,
+    Message,
+    PermissionDeniedError,
+    RateLimitError,
+    acompletion,
+)
 from pydantic import ValidationError
 from starlette.datastructures import FormData, UploadFile
 from dataset_uploads import (
     MAX_DATASET_UPLOAD_BYTES,
     dataset_context_note,
     push_dataset_upload_to_hub,
+)
+from agent.core.web_models import (
+    AVAILABLE_MODELS,
+    PICKER_MODEL_IDS,
+    missing_direct_provider_key_env,
+    resolve_default_model_id,
 )
 from models import (
     ApprovalRequest,
@@ -57,15 +69,8 @@ from agent.core.hf_tokens import resolve_hf_request_token
 from agent.core.local_models import local_model_provider
 from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
 from agent.core.model_ids import (
-    CLAUDE_OPUS_48_MODEL_ID,
-    CLAUDE_OPUS_55_MODEL_ID,
-    CLAUDE_SONNET_55_MODEL_ID,
-    DIRECT_PROVIDER_API_KEY_ENV,
-    GLM_52_MODEL_ID,
-    GPT_55_MODEL_ID,
-    KIMI_K27_CODE_MODEL_ID,
-    MINIMAX_M3_MODEL_ID,
     direct_provider_for,
+    is_direct_anthropic_model_id,
     strip_huggingface_model_prefix,
 )
 from agent.core.prompt_caching import with_prompt_cache_params
@@ -76,9 +81,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["agent"])
 _background_route_tasks: set[asyncio.Task] = set()
 
-DEFAULT_GPT_MODEL_ID = GPT_55_MODEL_ID
-DEFAULT_MODEL_ID = GLM_52_MODEL_ID
 DATASET_UPLOAD_MULTIPART_SLACK_BYTES = 1024 * 1024
+# LLM health probe: one tiny completion (see _health_probe_kwargs).
+HEALTH_PROBE_MAX_TOKENS = 1
+HEALTH_PROBE_TIMEOUT_S = 10
+HEALTH_PROBE_ROUTER_EFFORT = "high"
 
 
 async def _reset_usage_window(session_id: str) -> dict[str, Any] | None:
@@ -120,81 +127,19 @@ def _schedule_usage_refresh_and_upload(
     task.add_done_callback(_background_route_tasks.discard)
 
 
-def _available_models() -> list[dict[str, Any]]:
-    # Curated dropdown for this fork: HF Router models plus direct-API options.
-    # Claude Opus 4.8 goes through the HF Router (HF token). Claude Opus/Sonnet
-    # 5.5 call api.anthropic.com with ANTHROPIC_API_KEY, and DeepSeek uses the
-    # direct ``deepseek/`` provider (DEEPSEEK_API_KEY), matching
-    # agent/core/llm_params.py routing. GLM 5.2 stays the default.
-    models = [
-        {
-            "id": CLAUDE_OPUS_48_MODEL_ID,
-            "label": "Claude Opus 4.8",
-        },
-        {
-            "id": CLAUDE_OPUS_55_MODEL_ID,
-            "label": "Claude Opus 5.5",
-        },
-        {
-            "id": CLAUDE_SONNET_55_MODEL_ID,
-            "label": "Claude Sonnet 5.5",
-        },
-        {
-            "id": DEFAULT_GPT_MODEL_ID,
-            "label": "GPT-5.5",
-        },
-        {
-            "id": KIMI_K27_CODE_MODEL_ID,
-            "label": "Kimi K2.7 Code",
-        },
-        {
-            "id": MINIMAX_M3_MODEL_ID,
-            "label": "MiniMax M3",
-        },
-        {
-            "id": DEFAULT_MODEL_ID,
-            "label": "GLM 5.2",
-            "recommended": True,
-        },
-        # DeepSeek via the direct ``deepseek/`` provider (DEEPSEEK_API_KEY →
-        # api.deepseek.com), matching agent/core/llm_params.py routing. Distinct
-        # from the HF-router DeepSeek id so the user's own DeepSeek key is used.
-        # Selectable from the picker; GLM 5.2 remains the default.
-        {
-            "id": "deepseek/deepseek-v4-pro",
-            "label": "DeepSeek V4 Pro",
-        },
-        {
-            "id": "deepseek/deepseek-v4-flash",
-            "label": "DeepSeek V4 Flash",
-        },
-    ]
-    return models
-
-
-AVAILABLE_MODELS = _available_models()
-
-
-def _valid_model_ids() -> set[str]:
-    return {m["id"] for m in AVAILABLE_MODELS}
-
-
 def _validate_model_id(model_id: str | None) -> None:
-    if not model_id or model_id in _valid_model_ids():
+    if not model_id or model_id in PICKER_MODEL_IDS:
         return
     raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
-
-
-def _default_model() -> str:
-    return DEFAULT_MODEL_ID
 
 
 def _model_override_for_new_session(requested_model: str | None) -> str | None:
     """Return the model override to use when creating a new session.
 
-    Explicit model requests are honored. Empty web requests default to GLM 5.2.
+    Explicit model requests are honored. Empty web requests use the web
+    default (Claude Opus 5.5, or GLM 5.2 when its key is missing).
     """
-    return requested_model or _default_model()
+    return requested_model or resolve_default_model_id()
 
 
 def _user_hf_token(user: dict[str, Any] | None) -> str | None:
@@ -224,11 +169,8 @@ def _require_direct_provider_key(model_id: str | None) -> None:
     Read at request time so the check matches what ``_resolve_llm_params``
     will see. Only the env var's name is reported, never its value.
     """
-    provider = direct_provider_for(model_id)
-    if provider is None:
-        return
-    env_name = DIRECT_PROVIDER_API_KEY_ENV[provider]
-    if (os.environ.get(env_name) or "").strip():
+    env_name = missing_direct_provider_key_env(model_id)
+    if env_name is None:
         return
     raise HTTPException(
         status_code=400,
@@ -336,6 +278,51 @@ async def health_check() -> HealthResponse:
     )
 
 
+def _health_probe_kwargs(model: str, hf_token: str | None) -> dict[str, Any]:
+    """LiteLLM kwargs for the health probe: a 1-token completion.
+
+    Direct Claude (Opus/Sonnet 5.5) always thinks and takes effort only as
+    ``output_config``, which a reachability probe doesn't need, so it gets no
+    effort, and the probe's ``max_tokens`` replaces its resolved output
+    budget. Its request then carries no thinking, effort or sampling params.
+    Other models keep their historical probe shape (effort "high").
+    """
+    effort = None if is_direct_anthropic_model_id(model) else HEALTH_PROBE_ROUTER_EFFORT
+    llm_params = _resolve_llm_params(model, hf_token, reasoning_effort=effort)
+    return {
+        **llm_params,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": HEALTH_PROBE_MAX_TOKENS,
+        "timeout": HEALTH_PROBE_TIMEOUT_S,
+    }
+
+
+def _health_error_type(error: Exception) -> str:
+    """Bucket a failed health probe for the UI banner.
+
+    Exception types win over text. A bare "invalid" is not an auth signal:
+    every Anthropic 400 is an ``invalid_request_error``, including "Your
+    credit balance is too low".
+    """
+    if isinstance(error, (AuthenticationError, PermissionDeniedError)):
+        return "auth"
+    if isinstance(error, RateLimitError):
+        return "rate_limit"
+    err_str = str(error).lower()
+    if "401" in err_str or "auth" in err_str or "api key" in err_str:
+        return "auth"
+    if any(
+        marker in err_str
+        for marker in ("402", "credit", "quota", "insufficient", "billing")
+    ):
+        return "credits"
+    if "429" in err_str or "rate" in err_str:
+        return "rate_limit"
+    if "timeout" in err_str or "connect" in err_str or "network" in err_str:
+        return "network"
+    return "unknown"
+
+
 @router.get("/health/llm", response_model=LLMHealthResponse)
 async def llm_health_check(
     request: Request,
@@ -343,57 +330,37 @@ async def llm_health_check(
 ) -> LLMHealthResponse:
     """Check if the LLM provider is reachable and the API key is valid.
 
-    Makes a minimal 1-token completion call against the authenticated user's
-    default model when a token is available. For token-less HF Router requests,
-    returns ``status="skipped"`` instead of making an unauthenticated probe.
+    Makes a minimal 1-token completion call against the web default model
+    (Claude Opus 5.5 on the direct Anthropic API, or GLM 5.2 when its key is
+    missing). Direct-provider models need no HF token. For token-less HF
+    Router requests, returns ``status="skipped"`` instead of making an
+    unauthenticated probe. A direct-provider key that is missing at call time
+    is reported as an ``auth`` error without any network call.
     Catches common errors:
     - 401 → invalid API key
     - 402/insufficient_quota → out of credits
     - 429 → rate limited
     - timeout / network → provider unreachable
     """
-    model = _default_model()
+    model = resolve_default_model_id()
     hf_token = resolve_hf_request_token(request)
     if _model_requires_hf_router_token(model) and not hf_token:
         return LLMHealthResponse(status="skipped", model=model)
 
     try:
-        llm_params = _resolve_llm_params(
-            model,
-            hf_token,
-            reasoning_effort="high",
-        )
-        await acompletion(
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-            timeout=10,
-            **llm_params,
-        )
+        await acompletion(**_health_probe_kwargs(model, hf_token))
         return LLMHealthResponse(status="ok", model=model)
+    except MissingProviderKeyError as e:
+        # Raised before any network call; the message names only the env var.
+        logger.warning("LLM health check failed (auth): %s", e)
+        return LLMHealthResponse(
+            status="error",
+            model=model,
+            error=str(e),
+            error_type="auth",
+        )
     except Exception as e:
-        err_str = str(e).lower()
-        error_type = "unknown"
-
-        if (
-            "401" in err_str
-            or "auth" in err_str
-            or "invalid" in err_str
-            or "api key" in err_str
-        ):
-            error_type = "auth"
-        elif (
-            "402" in err_str
-            or "credit" in err_str
-            or "quota" in err_str
-            or "insufficient" in err_str
-            or "billing" in err_str
-        ):
-            error_type = "credits"
-        elif "429" in err_str or "rate" in err_str:
-            error_type = "rate_limit"
-        elif "timeout" in err_str or "connect" in err_str or "network" in err_str:
-            error_type = "network"
-
+        error_type = _health_error_type(e)
         logger.warning(f"LLM health check failed ({error_type}): {e}")
         return LLMHealthResponse(
             status="error",
@@ -405,9 +372,13 @@ async def llm_health_check(
 
 @router.get("/config/model")
 async def get_model() -> dict:
-    """Get current model and available models. No auth required."""
+    """Get the web default model and the picker list. No auth required.
+
+    ``current`` is what a new session would use right now, so it follows the
+    Anthropic key rather than the config file's ``model_name``.
+    """
     return {
-        "current": session_manager.config.model_name,
+        "current": resolve_default_model_id(),
         "available": AVAILABLE_MODELS,
     }
 

@@ -28,7 +28,12 @@ import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
 import UsageMeter from '@/components/UsageMeter';
 import { apiFetch } from '@/utils/api';
-import { inferenceCreditCta, isInferenceCreditError } from '@/utils/inferenceBilling';
+import {
+  creditCtaForModel,
+  inferenceCreditCta,
+  isInferenceCreditError,
+} from '@/utils/inferenceBilling';
+import { isDirectAnthropicPath } from '@/utils/model';
 import { loadBackendMessages } from '@/lib/backend-message-store';
 import { loadMessages } from '@/lib/chat-message-store';
 
@@ -204,10 +209,19 @@ export default function AppLayout() {
       ? 'LLM Provider Unreachable'
       : 'LLM Error'
     : '';
-  const llmCreditCta =
-    llmHealthError && isInferenceCreditError(llmHealthError.error, llmHealthError.errorType)
-      ? inferenceCreditCta(user?.plan)
-      : null;
+  // The health probe targets the web default, which is Claude on the direct
+  // Anthropic API when ANTHROPIC_API_KEY is set: its credit / key problems get
+  // the Anthropic notice, never the HF PRO upsell. HF Router models keep the
+  // HF credits CTA exactly as before.
+  const llmCreditCta = !llmHealthError
+    ? null
+    : isDirectAnthropicPath(llmHealthError.model)
+      ? creditCtaForModel(llmHealthError.model, llmHealthError.error, user?.plan)
+      : isInferenceCreditError(llmHealthError.error, llmHealthError.errorType)
+        ? inferenceCreditCta(user?.plan)
+        : null;
+  const llmHfCta = llmCreditCta?.kind === 'hf' ? llmCreditCta : null;
+  const llmAnthropicNotice = llmCreditCta?.kind === 'anthropic' ? llmCreditCta : null;
 
   const trackHealthProClick = () => {
     if (user?.plan === 'pro' || !activeSessionId) return;
@@ -493,18 +507,23 @@ export default function AppLayout() {
           sx={{ fontSize: '0.8rem', maxWidth: 480 }}
         >
           <AlertTitle sx={{ fontWeight: 700, fontSize: '0.85rem' }}>
-            {llmErrorTitle}
+            {llmAnthropicNotice ? llmAnthropicNotice.title : llmErrorTitle}
           </AlertTitle>
           {llmHealthError && (
             <Typography variant="body2" sx={{ fontSize: '0.78rem', opacity: 0.9 }}>
               {llmHealthError.model} — {llmHealthError.error.slice(0, 150)}
             </Typography>
           )}
-          {llmCreditCta && (
+          {llmAnthropicNotice && (
+            <Typography variant="body2" sx={{ fontSize: '0.78rem', mt: 0.75 }}>
+              {llmAnthropicNotice.message}
+            </Typography>
+          )}
+          {llmHfCta && (
             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 1 }}>
               <Button
                 component="a"
-                href={llmCreditCta.primaryHref}
+                href={llmHfCta.primaryHref}
                 target="_blank"
                 rel="noopener noreferrer"
                 color="inherit"
@@ -513,19 +532,19 @@ export default function AppLayout() {
                 onClick={trackHealthProClick}
                 sx={{ textTransform: 'none' }}
               >
-                {llmCreditCta.primaryLabel}
+                {llmHfCta.primaryLabel}
               </Button>
-              {llmCreditCta.secondaryHref && llmCreditCta.secondaryLabel && (
+              {llmHfCta.secondaryHref && llmHfCta.secondaryLabel && (
                 <Button
                   component="a"
-                  href={llmCreditCta.secondaryHref}
+                  href={llmHfCta.secondaryHref}
                   target="_blank"
                   rel="noopener noreferrer"
                   color="inherit"
                   size="small"
                   sx={{ textTransform: 'none' }}
                 >
-                  {llmCreditCta.secondaryLabel}
+                  {llmHfCta.secondaryLabel}
                 </Button>
               )}
             </Box>

@@ -11,37 +11,50 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from agent.core.model_ids import (  # noqa: E402
+    CLAUDE_OPUS_48_MODEL_ID,
+    CLAUDE_OPUS_55_MODEL_ID,
+    CLAUDE_SONNET_55_MODEL_ID,
+    GLM_52_MODEL_ID,
+    GPT_55_MODEL_ID,
+)
 from agent.core.prompt_caching import HF_ROUTER_SESSION_ID_HEADER  # noqa: E402
 from routes import agent  # noqa: E402
 from dependencies import INTERNAL_HF_TOKEN_KEY  # noqa: E402
 
 BILLING_SESSION_ID = "00000000-0000-4000-8000-000000000001"
+DEFAULT_MODEL_ENV = "ML_INTERN_DEFAULT_MODEL_ID"
+
+
+def _pin_default_model_env(monkeypatch, anthropic_key: str | None) -> None:
+    """Make the web default deterministic, whatever the local .env holds."""
+    monkeypatch.delenv(DEFAULT_MODEL_ENV, raising=False)
+    if anthropic_key is None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", anthropic_key)
 
 
 def test_available_models_have_no_pro_gate():
     models = {model["id"]: model for model in agent.AVAILABLE_MODELS}
 
-    assert models[agent.CLAUDE_OPUS_48_MODEL_ID]["label"] == "Claude Opus 4.8"
-    assert models[agent.CLAUDE_OPUS_55_MODEL_ID]["label"] == "Claude Opus 5.5"
-    assert models[agent.CLAUDE_SONNET_55_MODEL_ID]["label"] == "Claude Sonnet 5.5"
-    assert "recommended" not in models[agent.CLAUDE_OPUS_55_MODEL_ID]
-    assert "recommended" not in models[agent.CLAUDE_SONNET_55_MODEL_ID]
-    assert models[agent.DEFAULT_MODEL_ID]["label"] == "GLM 5.2"
+    assert models[CLAUDE_OPUS_48_MODEL_ID]["label"] == "Claude Opus 4.8"
+    assert models[CLAUDE_OPUS_55_MODEL_ID]["label"] == "Claude Opus 5.5"
+    assert models[CLAUDE_SONNET_55_MODEL_ID]["label"] == "Claude Sonnet 5.5"
+    assert models[CLAUDE_OPUS_55_MODEL_ID]["recommended"] is True
+    assert "recommended" not in models[CLAUDE_SONNET_55_MODEL_ID]
+    assert models[GLM_52_MODEL_ID]["label"] == "GLM 5.2"
     assert models["moonshotai/Kimi-K2.7-Code:novita"]["label"] == "Kimi K2.7 Code"
     assert models["MiniMaxAI/MiniMax-M3:novita"]["label"] == "MiniMax M3"
-    assert "recommended" not in models[agent.CLAUDE_OPUS_48_MODEL_ID]
-    assert models[agent.DEFAULT_MODEL_ID]["recommended"] is True
+    assert "recommended" not in models[CLAUDE_OPUS_48_MODEL_ID]
+    assert "recommended" not in models[GLM_52_MODEL_ID]
     assert all("provider" not in model for model in models.values())
     assert all("minimum_plan" not in model for model in models.values())
     assert all("tier" not in model for model in models.values())
 
 
-def test_default_model_is_glm():
-    assert agent._default_model() == agent.DEFAULT_MODEL_ID
-
-
 @pytest.mark.asyncio
-async def test_llm_health_uses_default_and_request_hf_token(monkeypatch):
+async def test_llm_health_uses_glm_fallback_and_request_hf_token(monkeypatch):
     class Request:
         headers = {"Authorization": "Bearer user-token"}
         cookies = {}
@@ -65,18 +78,14 @@ async def test_llm_health_uses_default_and_request_hf_token(monkeypatch):
     async def fake_acompletion(**kwargs):
         completions.append(kwargs)
 
-    monkeypatch.setattr(
-        agent.session_manager,
-        "config",
-        SimpleNamespace(model_name=agent.DEFAULT_MODEL_ID),
-    )
+    _pin_default_model_env(monkeypatch, anthropic_key=None)
     monkeypatch.setattr(agent, "_resolve_llm_params", fake_resolve_llm_params)
     monkeypatch.setattr(agent, "acompletion", fake_acompletion)
 
     response = await agent.llm_health_check(Request(), {"user_id": "u1", "plan": "pro"})
 
     assert response.status == "ok"
-    assert resolved == [(agent.DEFAULT_MODEL_ID, "user-token", "high", False)]
+    assert resolved == [(GLM_52_MODEL_ID, "user-token", "high", False)]
     assert completions[0]["api_key"] == "user-token"
 
 
@@ -95,10 +104,11 @@ async def test_llm_health_skips_router_probe_without_token(monkeypatch):
         raise AssertionError("health check should not call LiteLLM without token")
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    _pin_default_model_env(monkeypatch, anthropic_key=None)
     monkeypatch.setattr(
         agent.session_manager,
         "config",
-        SimpleNamespace(model_name=agent.CLAUDE_OPUS_48_MODEL_ID),
+        SimpleNamespace(model_name=CLAUDE_OPUS_48_MODEL_ID),
     )
     monkeypatch.setattr(agent, "_resolve_llm_params", fail_resolve_llm_params)
     monkeypatch.setattr(agent, "acompletion", fail_acompletion)
@@ -108,7 +118,7 @@ async def test_llm_health_skips_router_probe_without_token(monkeypatch):
     )
 
     assert response.status == "skipped"
-    assert response.model == agent.DEFAULT_MODEL_ID
+    assert response.model == GLM_52_MODEL_ID
 
 
 @pytest.mark.asyncio
@@ -172,14 +182,10 @@ async def test_generate_title_omits_session_id_from_hf_router(monkeypatch):
     assert titles == [("session-1", "Clean title")]
 
 
-def test_empty_session_model_uses_glm_default():
-    assert agent._model_override_for_new_session(None) == agent.DEFAULT_MODEL_ID
-
-
 def test_explicit_session_model_is_honored():
-    model = agent._model_override_for_new_session(agent.DEFAULT_GPT_MODEL_ID)
+    model = agent._model_override_for_new_session(GPT_55_MODEL_ID)
 
-    assert model == agent.DEFAULT_GPT_MODEL_ID
+    assert model == GPT_55_MODEL_ID
 
 
 @pytest.mark.asyncio
@@ -203,13 +209,13 @@ async def test_switching_to_opus_is_allowed_for_free_user(monkeypatch):
 
     response = await agent.set_session_model(
         "s1",
-        {"model": agent.CLAUDE_OPUS_48_MODEL_ID},
+        {"model": CLAUDE_OPUS_48_MODEL_ID},
         request=None,
         user={"user_id": "u1", "plan": "free"},
     )
 
-    assert response == {"session_id": "s1", "model": agent.CLAUDE_OPUS_48_MODEL_ID}
-    assert updated == [("s1", agent.CLAUDE_OPUS_48_MODEL_ID)]
+    assert response == {"session_id": "s1", "model": CLAUDE_OPUS_48_MODEL_ID}
+    assert updated == [("s1", CLAUDE_OPUS_48_MODEL_ID)]
 
 
 @pytest.mark.asyncio
@@ -231,13 +237,13 @@ async def test_switching_to_gpt_is_allowed_for_free_user(monkeypatch):
 
     response = await agent.set_session_model(
         "s1",
-        {"model": agent.DEFAULT_GPT_MODEL_ID},
+        {"model": GPT_55_MODEL_ID},
         request=None,
         user={"user_id": "u1", "plan": "free"},
     )
 
-    assert response == {"session_id": "s1", "model": agent.DEFAULT_GPT_MODEL_ID}
-    assert updated == [("s1", agent.DEFAULT_GPT_MODEL_ID)]
+    assert response == {"session_id": "s1", "model": GPT_55_MODEL_ID}
+    assert updated == [("s1", GPT_55_MODEL_ID)]
 
 
 @pytest.mark.asyncio
@@ -281,6 +287,7 @@ async def test_restore_summary_uses_default_model_without_quota_gate(monkeypatch
         events.append(("seed", session_id))
         return len(messages)
 
+    _pin_default_model_env(monkeypatch, anthropic_key="sk-ant-test")
     monkeypatch.setattr(agent.session_manager, "create_session", fake_create_session)
     monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(agent.session_manager, "seed_from_summary", fake_seed)
@@ -292,9 +299,9 @@ async def test_restore_summary_uses_default_model_without_quota_gate(monkeypatch
     )
 
     assert response.session_id == "s1"
-    assert response.model == agent.DEFAULT_MODEL_ID
+    assert response.model == CLAUDE_OPUS_55_MODEL_ID
     assert events == [
-        ("create", agent.DEFAULT_MODEL_ID, "free"),
+        ("create", CLAUDE_OPUS_55_MODEL_ID, "free"),
         ("check", "s1", False),
         ("seed", "s1"),
     ]

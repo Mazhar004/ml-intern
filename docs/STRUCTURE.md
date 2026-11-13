@@ -132,7 +132,7 @@ tar -czf credit-fraud.tar.gz projects/credit-fraud/
 
 ## Models you can use
 
-The dropdown reads from `backend/routes/agent.py:AVAILABLE_MODELS`. Currently configured:
+The dropdown reads from `agent/core/web_models.py:AVAILABLE_MODELS`. Currently configured:
 
 - `deepseek/deepseek-v4-pro` (default, paid via DEEPSEEK_API_KEY in `.env`)
 - `deepseek/deepseek-v4-flash`

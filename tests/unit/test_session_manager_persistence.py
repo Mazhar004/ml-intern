@@ -17,7 +17,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from agent.core.model_ids import GLM_52_MODEL_ID  # noqa: E402
+from agent.core.model_ids import CLAUDE_OPUS_55_MODEL_ID, GLM_52_MODEL_ID  # noqa: E402
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from agent.core.usage_thresholds import USAGE_THRESHOLD_TOOL_NAME  # noqa: E402
 from agent.core.yolo_budget import YOLO_BUDGET_TOOL_NAME  # noqa: E402
@@ -853,10 +853,31 @@ async def test_yolo_budget_checker_uses_local_ledger_when_billing_lags(monkeypat
     assert pending["billing_source"] == "hf_billing_current_session"
 
 
-def test_unknown_saved_model_defaults_to_glm():
+DUMMY_ANTHROPIC_KEY = "sk-ant-test"
+WEB_DEFAULT_CASES = [
+    (DUMMY_ANTHROPIC_KEY, CLAUDE_OPUS_55_MODEL_ID),
+    (None, GLM_52_MODEL_ID),
+]
+
+
+def _pin_web_default_env(monkeypatch, anthropic_key: str | None) -> None:
+    """Make the web default deterministic, whatever the local .env holds."""
+    monkeypatch.delenv("ML_INTERN_DEFAULT_MODEL_ID", raising=False)
+    if anthropic_key is None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", anthropic_key)
+
+
+@pytest.mark.parametrize(("anthropic_key", "expected"), WEB_DEFAULT_CASES)
+def test_unknown_saved_model_restores_with_web_default(
+    monkeypatch, anthropic_key, expected
+):
+    _pin_web_default_env(monkeypatch, anthropic_key)
+
     model = SessionManager._model_from_saved_metadata("unsupported/model")
 
-    assert model == GLM_52_MODEL_ID
+    assert model == expected
 
 
 @pytest.mark.asyncio
@@ -1212,6 +1233,61 @@ async def test_lazy_restore_schedules_cpu_sandbox_preload():
         assert restored.session.user_plan == "free"
         assert not hasattr(restored.session, "_ml_intern_artifact_collection_task")
         assert not hasattr(restored.session, "_ml_intern_artifact_collection_slug")
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("anthropic_key", "expected"), WEB_DEFAULT_CASES)
+async def test_lazy_restore_without_saved_model_uses_web_default(
+    monkeypatch, anthropic_key, expected
+):
+    # Arrange: no saved model, and a config default that is not a picker id.
+    _pin_web_default_env(monkeypatch, anthropic_key)
+    store = RestoreStore(
+        metadata={
+            "session_id": "persisted-session",
+            "user_id": "owner",
+            "created_at": datetime.now(UTC),
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+
+    try:
+        # Act
+        restored = await manager.ensure_session_loaded(
+            "persisted-session", user_id="owner"
+        )
+
+        # Assert
+        assert restored is not None
+        assert restored.session.config.model_name == expected
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("anthropic_key", "expected"), WEB_DEFAULT_CASES)
+async def test_create_session_without_model_uses_web_default(
+    monkeypatch, anthropic_key, expected
+):
+    # Arrange
+    _pin_web_default_env(monkeypatch, anthropic_key)
+    manager = _manager_with_store(NoopSessionStore())
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+
+    try:
+        # Act
+        session_id = await manager.create_session(user_id="owner", hf_token="token")
+
+        # Assert
+        runtime_session = manager.sessions[session_id].session
+        assert runtime_session.config.model_name == expected
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)

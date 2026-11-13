@@ -59,11 +59,13 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
   },
   {
     // Direct Anthropic API (the user's own ANTHROPIC_API_KEY via LiteLLM's
-    // native ``anthropic/`` provider), not the HF Router Claude above.
+    // native ``anthropic/`` provider), not the HF Router Claude above. The
+    // web default; the backend falls back to GLM 5.2 when the key is unset.
     id: 'claude-opus-5-5',
     name: 'Claude Opus 5.5',
     modelPath: CLAUDE_OPUS_55_DIRECT_PATH,
     avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_55_DIRECT_PATH),
+    recommended: true,
   },
   {
     id: 'claude-sonnet-5-5',
@@ -94,12 +96,11 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
     name: 'GLM 5.2',
     modelPath: GLM_52_MODEL_PATH,
     avatarUrl: getHfAvatarUrl(GLM_52_MODEL_PATH),
-    recommended: true,
   },
   {
     // Direct DeepSeek provider (uses the user's own DEEPSEEK_API_KEY via the
     // ``deepseek/`` LiteLLM route in agent/core/llm_params.py), not the HF
-    // Router id. Selectable from the picker; GLM 5.2 remains the default.
+    // Router id. Selectable from the picker.
     id: 'deepseek-v4-pro',
     name: 'DeepSeek V4 Pro',
     modelPath: DEEPSEEK_V4_PRO_DIRECT_PATH,
@@ -107,7 +108,8 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
   },
 ];
 
-const DEFAULT_MODEL_PATH = GLM_52_MODEL_PATH;
+// Shown until /api/config/model reports the backend's current default.
+const DEFAULT_MODEL_PATH = CLAUDE_OPUS_55_DIRECT_PATH;
 
 const normalizeModelPath = (path: string | undefined) => (
   (path ?? '')

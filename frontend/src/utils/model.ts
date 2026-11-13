@@ -3,7 +3,7 @@
  * picker.
  *
  * Keep in sync with DEFAULT_MODEL_OPTIONS in components/Chat/ChatInput.tsx,
- * AVAILABLE_MODELS in backend/routes/agent.py and agent/core/model_ids.py.
+ * AVAILABLE_MODELS in agent/core/web_models.py and agent/core/model_ids.py.
  */
 
 export const CLAUDE_OPUS_48_MODEL_PATH = 'anthropic/claude-opus-4.8:fal-ai';

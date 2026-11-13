@@ -70,7 +70,7 @@ GITHUB_TOKEN=ghp_...
 
 ## Pick a model
 
-The model dropdown in the UI (top of the chat pane) lists everything declared in `AVAILABLE_MODELS` ([backend/routes/agent.py](../backend/routes/agent.py)). Default working set:
+The model dropdown in the UI (top of the chat pane) lists everything declared in `AVAILABLE_MODELS` ([agent/core/web_models.py](../agent/core/web_models.py)). Default working set:
 
 - **Kimi K2.6** — free, HF Router (recommended for casual use)
 - **GPT-5.5** — OpenAI direct

@@ -32,6 +32,7 @@ DEEPSEEK_PRO_ID = "deepseek/deepseek-v4-pro"
 DEEPSEEK_FLASH_ID = "deepseek/deepseek-v4-flash"
 HF_BILLING_PLUS_DIRECT_SOURCE = "hf_billing_plus_direct_provider"
 DUMMY_ANTHROPIC_KEY = "sk-ant-test"
+DEFAULT_MODEL_ENV = "ML_INTERN_DEFAULT_MODEL_ID"
 MISSING_KEY_MESSAGE = (
     "Claude via the Anthropic API needs ANTHROPIC_API_KEY. Add it to the repo "
     ".env and restart the backend."
@@ -105,13 +106,13 @@ def test_picker_lists_direct_claude_55_models_right_after_router_opus_48():
     assert models[CLAUDE_OPUS_55_MODEL_ID] == {
         "id": CLAUDE_OPUS_55_MODEL_ID,
         "label": "Claude Opus 5.5",
+        "recommended": True,
     }
     assert models[CLAUDE_SONNET_55_MODEL_ID] == {
         "id": CLAUDE_SONNET_55_MODEL_ID,
         "label": "Claude Sonnet 5.5",
     }
     assert models[CLAUDE_OPUS_48_MODEL_ID]["label"] == "Claude Opus 4.8"
-    assert agent._default_model() == GLM_52_MODEL_ID
 
 
 @pytest.mark.parametrize(
@@ -301,13 +302,53 @@ async def test_create_session_with_direct_claude_and_key_uses_direct_id(
 
 
 @pytest.mark.asyncio
-async def test_create_session_with_default_model_ignores_anthropic_key(monkeypatch):
+async def test_create_session_without_model_uses_claude_opus_55_with_key(
+    monkeypatch,
+):
     # Arrange
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", DUMMY_ANTHROPIC_KEY)
+    monkeypatch.delenv(DEFAULT_MODEL_ENV, raising=False)
     created = _install_session_creation(monkeypatch)
 
     # Act
     response = await agent.create_session(_JsonRequest(), {"user_id": "u1"})
+
+    # Assert
+    assert response.model == CLAUDE_OPUS_55_MODEL_ID
+    assert created == [CLAUDE_OPUS_55_MODEL_ID]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_value", [None, "", "   "])
+async def test_create_session_without_model_falls_back_to_glm_without_key(
+    monkeypatch, missing_value
+):
+    # Arrange: a missing key must not turn the default into a 400.
+    if missing_value is None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", missing_value)
+    monkeypatch.delenv(DEFAULT_MODEL_ENV, raising=False)
+    created = _install_session_creation(monkeypatch)
+
+    # Act
+    response = await agent.create_session(_JsonRequest(), {"user_id": "u1"})
+
+    # Assert
+    assert response.model == GLM_52_MODEL_ID
+    assert created == [GLM_52_MODEL_ID]
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_explicit_glm_is_honored_with_key(monkeypatch):
+    # Arrange
+    monkeypatch.setenv("ANTHROPIC_API_KEY", DUMMY_ANTHROPIC_KEY)
+    created = _install_session_creation(monkeypatch)
+
+    # Act
+    response = await agent.create_session(
+        _JsonRequest({"model": GLM_52_MODEL_ID}), {"user_id": "u1"}
+    )
 
     # Assert
     assert response.model == GLM_52_MODEL_ID

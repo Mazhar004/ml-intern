@@ -14,7 +14,7 @@ Notes:
 - Vite proxies `/api` and `/auth` to `http://localhost:7860`.
 - If `127.0.0.1:7860` is already owned by another local process, binding the backend to `::1` lets the Vite proxy resolve `localhost` cleanly.
 - Prefer `npm ci` over `npm install` for setup, since `npm install` may rewrite `frontend/package-lock.json` metadata depending on npm version.
-- Non-local LLM calls use `https://router.huggingface.co/v1` with the active Hugging Face user's token. Web sessions and the CLI default to GLM 5.2. For local development, set `HF_TOKEN` and optionally `ML_INTERN_DEFAULT_MODEL_ID`.
+- Non-local LLM calls use `https://router.huggingface.co/v1` with the active Hugging Face user's token. Web sessions default to Claude Opus 5.5 on the direct Anthropic API (`ANTHROPIC_API_KEY`), falling back to GLM 5.2 when that key is unset (see `agent/core/web_models.py`); the CLI defaults to GLM 5.2. For local development, set `HF_TOKEN` and optionally `ML_INTERN_DEFAULT_MODEL_ID` (must be a picker model id).
 - When asked to start the local server, export the GitHub CLI token first with `export GITHUB_TOKEN="$(gh auth token)"`.
 - When debugging a web app issue tied to a session ID, inspect the session data in `smolagents/ml-intern-sessions` for additional context.
 
