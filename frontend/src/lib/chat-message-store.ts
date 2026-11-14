@@ -6,10 +6,13 @@
  * old Zustand-based store used, so existing data is compatible.
  */
 import type { UIMessage } from 'ai';
-import { logger } from '@/utils/logger';
+import {
+  pruneSessionCache,
+  UI_MESSAGES_CACHE_KEY,
+  writeSessionCache,
+} from '@/lib/safeStorage';
 
-const STORAGE_KEY = 'hf-agent-messages';
-const MAX_SESSIONS = 50;
+const STORAGE_KEY = UI_MESSAGES_CACHE_KEY;
 
 type MessagesMap = Record<string, UIMessage[]>;
 
@@ -28,12 +31,9 @@ function readAll(): MessagesMap {
   }
 }
 
-function writeAll(map: MessagesMap): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-  } catch (e) {
-    logger.warn('Failed to persist messages:', e);
-  }
+// Best-effort: bounded to recent sessions, and never throws on a full quota.
+function writeAll(map: MessagesMap, sessionId?: string): void {
+  writeSessionCache(STORAGE_KEY, map, sessionId);
 }
 
 export function loadMessages(sessionId: string): UIMessage[] {
@@ -44,16 +44,10 @@ export function loadMessages(sessionId: string): UIMessage[] {
 
 export function saveMessages(sessionId: string, messages: UIMessage[]): void {
   const map = readAll();
+  // Re-insert so key order stays least recently written first.
+  delete map[sessionId];
   map[sessionId] = messages;
-
-  // Evict oldest sessions if we exceed the cap
-  const keys = Object.keys(map);
-  if (keys.length > MAX_SESSIONS) {
-    const toRemove = keys.slice(0, keys.length - MAX_SESSIONS);
-    for (const k of toRemove) delete map[k];
-  }
-
-  writeAll(map);
+  writeAll(map, sessionId);
 }
 
 export function deleteMessages(sessionId: string): void {
@@ -67,5 +61,9 @@ export function moveMessages(fromId: string, toId: string): void {
   if (!map[fromId]) return;
   map[toId] = map[fromId];
   delete map[fromId];
-  writeAll(map);
+  writeAll(map, toId);
 }
+
+// Shrink a cache written before the size limits existed, and flatten the
+// legacy format (once per page load).
+pruneSessionCache(STORAGE_KEY, readAll());

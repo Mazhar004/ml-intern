@@ -17,6 +17,7 @@
  */
 import { create } from 'zustand';
 import type { User } from '@/types/agent';
+import { safeSetItem } from '@/lib/safeStorage';
 
 export interface PlanItem {
   id: string;
@@ -236,11 +237,7 @@ function loadToolErrors(): Record<string, boolean> {
 
 // Save tool errors to localStorage
 function saveToolErrors(errors: Record<string, boolean>): void {
-  try {
-    localStorage.setItem('hf-agent-tool-errors', JSON.stringify(errors));
-  } catch (e) {
-    console.warn('Failed to persist tool errors:', e);
-  }
+  safeSetItem('hf-agent-tool-errors', JSON.stringify(errors));
 }
 
 // Load persisted rejected tools from localStorage
@@ -255,11 +252,7 @@ function loadRejectedTools(): Record<string, boolean> {
 
 // Save rejected tools to localStorage
 function saveRejectedTools(rejected: Record<string, boolean>): void {
-  try {
-    localStorage.setItem('hf-agent-rejected-tools', JSON.stringify(rejected));
-  } catch (e) {
-    console.warn('Failed to persist rejected tools:', e);
-  }
+  safeSetItem('hf-agent-rejected-tools', JSON.stringify(rejected));
 }
 
 // Trackio dashboards survive a page reload — without persistence the iframe
@@ -275,11 +268,7 @@ function loadTrackioDashboards(): Record<string, { spaceId: string; project?: st
 }
 
 function saveTrackioDashboards(dashboards: Record<string, { spaceId: string; project?: string }>): void {
-  try {
-    localStorage.setItem('hf-agent-trackio-dashboards', JSON.stringify(dashboards));
-  } catch (e) {
-    console.warn('Failed to persist trackio dashboards:', e);
-  }
+  safeSetItem('hf-agent-trackio-dashboards', JSON.stringify(dashboards));
 }
 
 export const useAgentStore = create<AgentStore>()((set, get) => ({

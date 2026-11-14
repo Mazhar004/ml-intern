@@ -1,8 +1,9 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { createJSONStorage, persist } from 'zustand/middleware';
 import type { SessionMeta } from '@/types/agent';
 import { deleteMessages, moveMessages } from '@/lib/chat-message-store';
 import { moveBackendMessages, deleteBackendMessages } from '@/lib/backend-message-store';
+import { safeLocalStorage, setActiveSessionSource } from '@/lib/safeStorage';
 
 interface SessionStore {
   sessions: SessionMeta[];
@@ -430,6 +431,8 @@ export const useSessionStore = create<SessionStore>()(
     }),
     {
       name: 'hf-agent-sessions',
+      // A full localStorage must not make actions like createSession throw.
+      storage: createJSONStorage(() => safeLocalStorage),
       partialize: (state) => ({
         // Reset transient processing so cold-load state is re-derived from
         // the live GET /sessions list.
@@ -442,3 +445,6 @@ export const useSessionStore = create<SessionStore>()(
     }
   )
 );
+
+// Freeing localStorage space never evicts the cached messages of the chat on screen.
+setActiveSessionSource(() => useSessionStore.getState().activeSessionId);

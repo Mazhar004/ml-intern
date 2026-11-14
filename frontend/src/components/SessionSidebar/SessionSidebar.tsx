@@ -22,6 +22,7 @@ import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { useUsageStore } from '@/store/usageStore';
 import { apiFetch } from '@/utils/api';
+import { safeSetItem } from '@/lib/safeStorage';
 import {
   normalizeSessionTitle,
   saveSessionTitle,
@@ -93,6 +94,9 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     if (isCreatingSession) return;
     setIsCreatingSession(true);
     setCapacityError(null);
+    // Set once the backend has created the session: after that, a failing
+    // local step must not be reported as "Failed to create session.".
+    let created: { id: string; model?: string | null } | null = null;
     try {
       // Project picker: prompt for the project folder this session lives in.
       // Empty input → no project sandbox (server-wide ML_INTERN_PROJECT_ROOT
@@ -118,7 +122,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
       }
       const trimmed = project.trim();
       if (trimmed) {
-        localStorage.setItem('ml-intern.lastProject', trimmed);
+        safeSetItem('ml-intern.lastProject', trimmed);
       }
 
       const response = await apiFetch('/api/session', {
@@ -131,18 +135,39 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         setCapacityError(data.detail || 'Server is at capacity.');
         return;
       }
+      if (!response.ok) {
+        throw new Error(`POST /api/session returned ${response.status}`);
+      }
       const data = await response.json();
+      if (typeof data.session_id !== 'string' || !data.session_id) {
+        throw new Error('POST /api/session returned no session_id');
+      }
+      created = { id: data.session_id, model: data.model };
       createSession(data.session_id, data.model);
       void useUsageStore.getState().fetchUsage(data.session_id);
       setPlan([]);
       clearPanel();
       onClose?.();
-    } catch {
-      setCapacityError('Failed to create session.');
+    } catch (error) {
+      if (created) {
+        const { id, model } = created;
+        console.error(`Session ${id} was created, but setting it up locally failed:`, error);
+        // Best effort: the backend session exists, so still put it on screen.
+        try {
+          if (useSessionStore.getState().sessions.some((s) => s.id === id)) switchSession(id);
+          else createSession(id, model);
+          onClose?.();
+        } catch (switchError) {
+          console.error(`Could not switch to new session ${id}:`, switchError);
+        }
+      } else {
+        console.error('Failed to create session:', error);
+        setCapacityError('Failed to create session.');
+      }
     } finally {
       setIsCreatingSession(false);
     }
-  }, [isCreatingSession, createSession, setPlan, clearPanel, onClose]);
+  }, [isCreatingSession, createSession, switchSession, setPlan, clearPanel, onClose]);
 
   // -- Delete with dialog confirmation ------------------------------------
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);

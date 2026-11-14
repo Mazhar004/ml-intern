@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import { safeLocalStorage } from '@/lib/safeStorage';
 
 export type ThemeMode = 'dark' | 'light';
 
@@ -35,6 +36,7 @@ export const useLayoutStore = create<LayoutStore>()(
     }),
     {
       name: 'hf-agent-layout',
+      storage: createJSONStorage(() => safeLocalStorage),
       partialize: (state) => ({ themeMode: state.themeMode }),
     }
   )

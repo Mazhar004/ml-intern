@@ -15,6 +15,7 @@ import { loadMessages, saveMessages } from '@/lib/chat-message-store';
 import { saveBackendMessages } from '@/lib/backend-message-store';
 import { saveResearch, loadResearch, clearResearch, RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import { llmMessagesToUIMessages, type PendingApprovalItem } from '@/lib/convert-llm-messages';
+import { safeSetItem } from '@/lib/safeStorage';
 import { apiFetch } from '@/utils/api';
 import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
@@ -747,7 +748,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           const event = JSON.parse(eventData.trim());
           const seq = event.seq ?? (eventId ? Number(eventId) : undefined);
           if (Number.isFinite(seq)) {
-            localStorage.setItem(lastEventKey, String(seq));
+            safeSetItem(lastEventKey, String(seq));
           }
           eventId = null;
           eventData = '';

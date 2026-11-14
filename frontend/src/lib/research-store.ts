@@ -3,6 +3,7 @@
  * Survives page refresh so the rolling display isn't lost mid-research.
  */
 import type { PerSessionState } from '@/store/agentStore';
+import { safeSetItem } from '@/lib/safeStorage';
 
 /** Max steps to keep in storage and display. Single source of truth. */
 export const RESEARCH_MAX_STEPS = 4;
@@ -26,9 +27,7 @@ function readAll(): ResearchMap {
 }
 
 function writeAll(map: ResearchMap): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-  } catch { /* quota exceeded — ignore */ }
+  safeSetItem(STORAGE_KEY, JSON.stringify(map));
 }
 
 export function saveResearch(

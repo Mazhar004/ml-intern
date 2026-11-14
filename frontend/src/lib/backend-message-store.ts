@@ -4,10 +4,13 @@
  * Space restarts — the browser-side UIMessages are what the user sees,
  * but the LLM needs the backend format to continue the conversation.
  */
-import { logger } from '@/utils/logger';
+import {
+  BACKEND_MESSAGES_CACHE_KEY,
+  pruneSessionCache,
+  writeSessionCache,
+} from '@/lib/safeStorage';
 
-const STORAGE_KEY = 'hf-agent-backend-messages';
-const MAX_SESSIONS = 50;
+const STORAGE_KEY = BACKEND_MESSAGES_CACHE_KEY;
 
 type MessagesMap = Record<string, unknown[]>;
 
@@ -25,13 +28,9 @@ function readAll(): MessagesMap {
   }
 }
 
-function writeAll(map: MessagesMap): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-  } catch (e) {
-    // Quota exceeded is the most common reason — the cache is best-effort.
-    logger.warn('Failed to persist backend messages:', e);
-  }
+// Best-effort: bounded to recent sessions, and never throws on a full quota.
+function writeAll(map: MessagesMap, sessionId?: string): void {
+  writeSessionCache(STORAGE_KEY, map, sessionId);
 }
 
 export function loadBackendMessages(sessionId: string): unknown[] {
@@ -41,15 +40,10 @@ export function loadBackendMessages(sessionId: string): unknown[] {
 
 export function saveBackendMessages(sessionId: string, messages: unknown[]): void {
   const map = readAll();
+  // Re-insert so key order stays least recently written first.
+  delete map[sessionId];
   map[sessionId] = messages;
-
-  const keys = Object.keys(map);
-  if (keys.length > MAX_SESSIONS) {
-    const toRemove = keys.slice(0, keys.length - MAX_SESSIONS);
-    for (const k of toRemove) delete map[k];
-  }
-
-  writeAll(map);
+  writeAll(map, sessionId);
 }
 
 export function moveBackendMessages(fromId: string, toId: string): void {
@@ -57,7 +51,7 @@ export function moveBackendMessages(fromId: string, toId: string): void {
   if (!map[fromId]) return;
   map[toId] = map[fromId];
   delete map[fromId];
-  writeAll(map);
+  writeAll(map, toId);
 }
 
 export function deleteBackendMessages(sessionId: string): void {
@@ -65,3 +59,6 @@ export function deleteBackendMessages(sessionId: string): void {
   delete map[sessionId];
   writeAll(map);
 }
+
+// Shrink a cache written before the size limits existed (once per page load).
+pruneSessionCache(STORAGE_KEY, readAll());

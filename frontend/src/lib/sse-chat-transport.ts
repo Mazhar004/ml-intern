@@ -8,6 +8,7 @@
 import type { ChatTransport, UIMessage, UIMessageChunk, ChatRequestOptions } from 'ai';
 import { apiFetch } from '@/utils/api';
 import { logger } from '@/utils/logger';
+import { safeSetItem } from '@/lib/safeStorage';
 import type { AgentEvent } from '@/types/events';
 import { useAgentStore } from '@/store/agentStore';
 
@@ -192,7 +193,7 @@ function createSSEParserStream(sessionId: string): TransformStream<string, Agent
       const seq = json.seq ?? (eventId ? Number(eventId) : undefined);
       if (Number.isFinite(seq)) {
         json.seq = seq;
-        localStorage.setItem(lastEventKey(sessionId), String(seq));
+        safeSetItem(lastEventKey(sessionId), String(seq));
       }
       controller.enqueue(json);
     } catch {
