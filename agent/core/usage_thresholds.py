@@ -1,10 +1,22 @@
 """Helpers for session usage-threshold approval warnings."""
 
+import os
 from typing import Any
 
 USAGE_THRESHOLD_TOOL_NAME = "usage_threshold"
 USAGE_WARNING_FIRST_THRESHOLD_USD = 5.0
 USAGE_WARNING_MULTIPLIER = 2.0
+
+# Set to 0/false/no/off to never pause the agent for the $5 / $10 / $20 …
+# session-spend approvals (e.g. a personal deployment on your own API keys).
+USAGE_THRESHOLD_APPROVALS_ENV = "ML_INTERN_USAGE_THRESHOLD_APPROVALS"
+_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def usage_threshold_approvals_enabled() -> bool:
+    """Whether spend thresholds pause the agent for approval. Read per call."""
+    value = (os.environ.get(USAGE_THRESHOLD_APPROVALS_ENV) or "").strip().lower()
+    return value not in _DISABLED_VALUES
 
 
 def normalize_usage_threshold(value: Any) -> float:

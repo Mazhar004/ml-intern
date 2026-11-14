@@ -15,6 +15,10 @@ services:
       - "7860:7860"
     env_file:
       - .env
+    environment:
+      # Personal deployment on your own API keys: don't pause the agent for
+      # the $5 / $10 / $20 … session-spend approvals. Remove to restore them.
+      ML_INTERN_USAGE_THRESHOLD_APPROVALS: "0"
     volumes:
       # Session histories — bind-mounted so native and Docker modes share
       # the same session_logs/ directory. Restart either backend and the

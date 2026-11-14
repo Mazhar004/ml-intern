@@ -27,6 +27,7 @@ from agent.core.usage_thresholds import (
     is_usage_threshold_pending,
     next_usage_warning_threshold,
     normalize_usage_threshold,
+    usage_threshold_approvals_enabled,
     usage_threshold_pending_to_tool,
 )
 from agent.core.yolo_budget import (
@@ -690,6 +691,10 @@ class SessionManager:
         session_id: str,
         continuation_payload: dict[str, Any],
     ) -> bool:
+        # Switched off (ML_INTERN_USAGE_THRESHOLD_APPROVALS=0): never pause the
+        # agent for session-spend warnings, and skip the billing lookups too.
+        if not usage_threshold_approvals_enabled():
+            return False
         agent_session = self.sessions.get(session_id)
         if not agent_session or not agent_session.is_active:
             return False
