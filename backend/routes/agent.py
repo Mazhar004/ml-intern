@@ -60,8 +60,11 @@ from models import (
 )
 from session_log_files import (
     find_latest_session_log,
+    find_session_logs,
+    is_safe_session_id,
     load_session_log,
     persist_title_to_latest_log,
+    resolve_session_log,
     saved_title_fields,
     session_log_dir,
     write_session_log_title,
@@ -1135,18 +1138,18 @@ async def delete_archived_session(
 ) -> dict:
     """Permanently delete a specific archived session JSON from disk.
     Idempotent: returns the list of files removed (empty if none matched).
+    Only this exact session's ``session_<id>_<timestamp>.json`` files are
+    removed; an id holding glob or path characters is rejected.
     """
-
-    log_dir = session_log_dir()
-    if not log_dir.exists():
-        return {"deleted": []}
+    if not is_safe_session_id(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id")
     deleted: list[str] = []
-    for f in log_dir.glob(f"session_{session_id}_*.json"):
+    for f in find_session_logs(session_id):
         try:
             f.unlink()
             deleted.append(f.name)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.warning("Could not delete archived session %s: %s", f.name, e)
     return {"deleted": deleted}
 
 
@@ -1176,18 +1179,15 @@ async def import_session_from_disk(
     if not sid_filter:
         raise HTTPException(status_code=400, detail="Missing 'session_id' in body")
 
-    log_dir = session_log_dir()
-    matches = list(log_dir.glob(f"session_{sid_filter}_*.json"))
-    if not matches:
-        # Fall back to filename match in case the user passed a full filename
-        matches = list(log_dir.glob(sid_filter)) + list(log_dir.glob(f"*{sid_filter}*"))
-    if not matches:
+    # A session id (newest log wins) or an exact session_<id>_<ts>.json
+    # filename. No glob or substring fallback: either could load another
+    # session's conversation.
+    src = resolve_session_log(sid_filter)
+    if src is None:
         raise HTTPException(
             status_code=404,
             detail=f"No session log matching '{sid_filter}' in ./session_logs/",
         )
-    # Pick the most recent
-    src = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
     try:
         data = _json.loads(src.read_text())
     except Exception as e:

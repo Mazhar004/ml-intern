@@ -26,6 +26,7 @@ SESSION_LOG_DIR = Path(__file__).resolve().parent / "session_logs"
 # metacharacters into the filename lookup.
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _LOG_TIMESTAMP = r"_\d{8}_\d{6}\.json"
+_LOG_FILENAME = re.compile(rf"^session_[A-Za-z0-9_-]{{1,128}}{_LOG_TIMESTAMP}$")
 
 
 def session_log_dir() -> Path:
@@ -33,22 +34,40 @@ def session_log_dir() -> Path:
     return SESSION_LOG_DIR
 
 
-def find_latest_session_log(session_id: str) -> Path | None:
-    """Return the newest ``session_<id>_<timestamp>.json`` for an exact id."""
-    if not _SAFE_SESSION_ID.match(session_id):
-        return None
+def is_safe_session_id(session_id: str | None) -> bool:
+    return bool(session_id) and bool(_SAFE_SESSION_ID.match(session_id))
+
+
+def find_session_logs(session_id: str) -> list[Path]:
+    """Every ``session_<id>_<YYYYMMDD>_<HHMMSS>.json`` for exactly this id.
+
+    Names are matched with an exact regex, never a glob, so ids holding glob
+    or path characters match nothing and ``abc`` never picks up ``abc_def``.
+    """
+    if not is_safe_session_id(session_id):
+        return []
     log_dir = session_log_dir()
     if not log_dir.is_dir():
-        return None
+        return []
     name_pattern = re.compile(rf"^session_{re.escape(session_id)}{_LOG_TIMESTAMP}$")
-    matches = [
-        path
-        for path in log_dir.glob(f"session_{session_id}_*.json")
-        if name_pattern.match(path.name)
-    ]
+    return [path for path in log_dir.iterdir() if name_pattern.match(path.name)]
+
+
+def find_latest_session_log(session_id: str) -> Path | None:
+    """Return the newest ``session_<id>_<timestamp>.json`` for an exact id."""
+    matches = find_session_logs(session_id)
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def resolve_session_log(identifier: str) -> Path | None:
+    """The log to import: the newest one for a session id, or an exact
+    ``session_<id>_<timestamp>.json`` filename inside the log directory."""
+    if _LOG_FILENAME.match(identifier):
+        path = session_log_dir() / identifier
+        return path if path.is_file() else None
+    return find_latest_session_log(identifier)
 
 
 def load_session_log(path: Path) -> dict[str, Any] | None:
