@@ -1,9 +1,30 @@
 """Pydantic models for API requests and responses."""
 
+import unicodedata
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+SESSION_TITLE_MAX_CHARS = 80
+
+
+def normalize_session_title(raw: str) -> str:
+    """Clean a user-supplied chat title, or raise ValueError.
+
+    Drops control characters, collapses every whitespace run (including
+    newlines) to one space, and trims. Over-long titles are rejected rather
+    than silently truncated.
+    """
+    visible = "".join(
+        ch for ch in raw if ch.isspace() or unicodedata.category(ch) != "Cc"
+    )
+    title = " ".join(visible.split())
+    if not title:
+        raise ValueError("Title must not be empty")
+    if len(title) > SESSION_TITLE_MAX_CHARS:
+        raise ValueError(f"Title must be at most {SESSION_TITLE_MAX_CHARS} characters")
+    return title
 
 
 class OpType(str, Enum):
@@ -102,10 +123,22 @@ class SessionInfo(BaseModel):
     model: str | None = None
     project: str | None = None  # project folder name, if session is bound to one
     title: str | None = None
+    title_is_custom: bool = False  # user renamed it; auto-title must not touch it
     notification_destinations: list[str] = Field(default_factory=list)
     auto_approval: SessionAutoApprovalInfo = Field(
         default_factory=SessionAutoApprovalInfo
     )
+
+
+class SessionTitleRequest(BaseModel):
+    """Rename a chat from the sidebar."""
+
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def _normalize_title(cls, value: str) -> str:
+        return normalize_session_title(value)
 
 
 class SessionNotificationsRequest(BaseModel):

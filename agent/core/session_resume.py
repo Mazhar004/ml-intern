@@ -238,6 +238,12 @@ def restore_session_from_log(session: Any, path: Path) -> dict[str, Any]:
 
     cm._recompute_usage(session.config.model_name)
 
+    # Carry the sidebar title so the next save doesn't drop a user rename.
+    saved_title = data.get("title")
+    if isinstance(saved_title, str) and saved_title.strip():
+        session.title = saved_title
+        session.title_is_custom = bool(data.get("title_is_custom"))
+
     saved_session_id = data.get("session_id")
     saved_user_id = data.get("user_id")
     is_continuation = saved_user_id == session.user_id

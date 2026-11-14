@@ -52,10 +52,19 @@ from models import (
     SessionInfo,
     SessionNotificationsRequest,
     SessionResponse,
+    SessionTitleRequest,
     SessionYoloRequest,
     SubmitRequest,
     TruncateRequest,
     UsageResponse,
+)
+from session_log_files import (
+    find_latest_session_log,
+    load_session_log,
+    persist_title_to_latest_log,
+    saved_title_fields,
+    session_log_dir,
+    write_session_log_title,
 )
 from session_manager import (
     MAX_SESSIONS,
@@ -399,7 +408,9 @@ async def generate_title(
     so the 60-token output budget isn't consumed before the title is written.
     """
     try:
-        await _check_session_access(request.session_id, user)
+        agent_session = await _check_session_access(request.session_id, user)
+        if getattr(agent_session, "title_is_custom", False):
+            return {"title": agent_session.title}
         llm_params = _resolve_llm_params(
             "openai/gpt-oss-120b:cerebras",
             _user_hf_token(user),
@@ -430,7 +441,10 @@ async def generate_title(
         if len(title) > 50:
             title = title[:50].rstrip() + "…"
         try:
-            await session_manager.update_session_title(request.session_id, title)
+            title = (
+                await session_manager.update_session_title(request.session_id, title)
+                or title
+            )
         except Exception:
             logger.debug(
                 "Skipping title persistence for missing session %s", request.session_id
@@ -442,7 +456,10 @@ async def generate_title(
         title = fallback[:40].rstrip() + "…" if len(fallback) > 40 else fallback
         try:
             await _check_session_access(request.session_id, user)
-            await session_manager.update_session_title(request.session_id, title)
+            title = (
+                await session_manager.update_session_title(request.session_id, title)
+                or title
+            )
         except Exception:
             logger.debug(
                 "Skipping fallback title persistence for missing session %s",
@@ -747,6 +764,60 @@ async def set_session_yolo(
     return {"session_id": session_id, **summary}
 
 
+async def _accessible_live_session(
+    session_id: str, user: dict[str, Any]
+) -> AgentSession | None:
+    """Like ``_check_session_access`` but None (not 404) when not loadable,
+    so callers can fall back to the session_logs/ archive."""
+    try:
+        return await _check_session_access(session_id, user, preload_sandbox=False)
+    except HTTPException as e:
+        if e.status_code == 404:
+            return None
+        raise
+
+
+def _rename_archived_session(session_id: str, title: str, user: dict[str, Any]) -> None:
+    """Write a custom title into the newest session_logs/ file of a session
+    that only exists on disk. Raises 404 / 403 / 500 HTTPExceptions."""
+    path = find_latest_session_log(session_id)
+    data = load_session_log(path) if path is not None else None
+    if path is None or data is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    owner = str(data.get("user_id") or "dev")
+    if user["user_id"] != "dev" and owner not in {user["user_id"], "dev"}:
+        raise HTTPException(status_code=403, detail="Access denied to this session")
+    try:
+        write_session_log_title(path, data, title=title, is_custom=True)
+    except OSError as e:
+        logger.error("Failed to write title into %s: %s", path.name, e)
+        raise HTTPException(status_code=500, detail="Could not save the new title")
+
+
+@router.patch("/session/{session_id}/title")
+async def rename_session_title(
+    session_id: str,
+    body: SessionTitleRequest,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Rename a chat. Manual names are sticky: auto-titling never overrides them.
+
+    Live sessions are renamed in memory and in the session store, and their
+    newest session_logs/ file is patched right away (later auto-saves carry
+    the title too). Sessions that only exist on disk get their newest
+    session_logs/ file rewritten atomically. 404 when neither knows the id.
+    """
+    agent_session = await _accessible_live_session(session_id, user)
+    if agent_session is None:
+        await asyncio.to_thread(_rename_archived_session, session_id, body.title, user)
+        return {"session_id": session_id, "title": body.title}
+    title = await session_manager.set_custom_session_title(session_id, body.title)
+    await asyncio.to_thread(
+        persist_title_to_latest_log, session_id, body.title, is_custom=True
+    )
+    return {"session_id": session_id, "title": title or body.title}
+
+
 @router.get("/user/jobs-access")
 async def get_jobs_access_info(
     request: Request, user: dict = Depends(get_current_user)
@@ -878,9 +949,8 @@ async def list_archived_sessions(
     Use ``POST /api/session/import`` to rehydrate.
     """
     import json as _json
-    from pathlib import Path as _Path
 
-    log_dir = _Path(__file__).resolve().parent.parent / "session_logs"
+    log_dir = session_log_dir()
     if not log_dir.exists():
         return []
     out: list[dict] = []
@@ -929,10 +999,13 @@ async def list_archived_sessions(
                 x.get("text", "") if isinstance(x, dict) else str(x)
                 for x in first_user_text
             )
+        title, title_is_custom = saved_title_fields(data)
         out.append(
             {
                 "session_id": data.get("session_id") or f.stem,
                 "filename": f.name,
+                "title": title,
+                "title_is_custom": title_is_custom,
                 "saved_at": data.get("last_save_time") or data.get("session_end_time"),
                 "model": data.get("model_name"),
                 "project": data.get("project")
@@ -958,9 +1031,8 @@ async def cleanup_dummy_archived_sessions(
     Returns ``{"deleted": [...filenames...], "kept": <int>}``.
     """
     import json as _json
-    from pathlib import Path as _Path
 
-    log_dir = _Path(__file__).resolve().parent.parent / "session_logs"
+    log_dir = session_log_dir()
     if not log_dir.exists():
         return {"deleted": [], "kept": 0}
 
@@ -1013,10 +1085,9 @@ async def deduplicate_archived_sessions(
     Returns ``{"deleted": [...], "kept": [...]}``. Destructive.
     """
     import json as _json
-    from pathlib import Path as _Path
     from collections import defaultdict
 
-    log_dir = _Path(__file__).resolve().parent.parent / "session_logs"
+    log_dir = session_log_dir()
     if not log_dir.exists():
         return {"deleted": [], "kept": []}
 
@@ -1065,9 +1136,8 @@ async def delete_archived_session(
     """Permanently delete a specific archived session JSON from disk.
     Idempotent: returns the list of files removed (empty if none matched).
     """
-    from pathlib import Path as _Path
 
-    log_dir = _Path(__file__).resolve().parent.parent / "session_logs"
+    log_dir = session_log_dir()
     if not log_dir.exists():
         return {"deleted": []}
     deleted: list[str] = []
@@ -1097,7 +1167,6 @@ async def import_session_from_disk(
     every tool call.
     """
     import json as _json
-    from pathlib import Path as _Path
 
     try:
         body = await request.json()
@@ -1107,7 +1176,7 @@ async def import_session_from_disk(
     if not sid_filter:
         raise HTTPException(status_code=400, detail="Missing 'session_id' in body")
 
-    log_dir = _Path(__file__).resolve().parent.parent / "session_logs"
+    log_dir = session_log_dir()
     matches = list(log_dir.glob(f"session_{sid_filter}_*.json"))
     if not matches:
         # Fall back to filename match in case the user passed a full filename
@@ -1165,6 +1234,9 @@ async def import_session_from_disk(
             logger.info(
                 f"Imported {len(seeded)} messages from {src.name} into new session {new_session_id}"
             )
+        saved_title, saved_title_is_custom = saved_title_fields(data)
+        if saved_title:
+            agent_session.set_title(saved_title, is_custom=saved_title_is_custom)
 
     return SessionResponse(session_id=new_session_id, ready=True)
 

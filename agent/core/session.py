@@ -174,6 +174,12 @@ class Session:
         self.usage_hf_billing_snapshot: dict[str, Any] | None = None
         self.usage_metrics: dict[str, Any] | None = None
 
+        # Sidebar title, written into every session_logs/ save so it survives
+        # restarts. ``title_is_custom`` marks a user rename that auto-titling
+        # must never overwrite. Set by the web backend; None in the CLI.
+        self.title: str | None = None
+        self.title_is_custom: bool = False
+
         # Session trajectory logging
         self.logged_events: list[dict] = []
         self.session_start_time = datetime.now().astimezone().isoformat()
@@ -469,6 +475,8 @@ class Session:
 
         self.session_id = str(uuid.uuid4())
         self.inference_billing_session_id = None
+        self.title = None
+        self.title_is_custom = False
         self.session_start_time = datetime.now().astimezone().isoformat()
         self.turn_count = 0
         self.last_auto_save_turn = 0
@@ -579,6 +587,8 @@ class Session:
             "session_start_time": self.session_start_time,
             "session_end_time": datetime.now().isoformat(),
             "model_name": self.config.model_name,
+            "title": self.title,
+            "title_is_custom": self.title_is_custom,
             "project": project_name,  # populated only for sessions bound to a project
             "total_cost_usd": total_cost_usd,
             "usage_metrics": usage_metrics,

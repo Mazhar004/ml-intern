@@ -9,17 +9,26 @@ import {
   DialogContentText,
   DialogTitle,
   IconButton,
+  Snackbar,
   Typography,
   CircularProgress,
   Divider,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { useUsageStore } from '@/store/usageStore';
 import { apiFetch } from '@/utils/api';
+import {
+  normalizeSessionTitle,
+  saveSessionTitle,
+  sessionDisplayTitle,
+} from '@/utils/sessionTitle';
+import type { SessionMeta } from '@/types/agent';
+import SessionTitleEditor from './SessionTitleEditor';
 
 interface SessionSidebarProps {
   onClose?: () => void;
@@ -34,6 +43,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     switchSession,
     mergeArchivedSessions,
     mergeServerSessions,
+    setSessionTitle,
   } =
     useSessionStore();
   const { setPlan, clearPanel } =
@@ -219,6 +229,36 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     [activeSessionId, mergeServerSessions, switchSession, onClose],
   );
 
+  // -- Rename (inline editor) ---------------------------------------------
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [renameError, setRenameError] = useState<string | null>(null);
+
+  const startRename = useCallback((sessionId: string, e: React.SyntheticEvent) => {
+    e.stopPropagation();
+    setEditingId(sessionId);
+  }, []);
+
+  // Optimistic: show the new name at once, revert if the server rejects it.
+  const commitRename = useCallback(
+    async (session: SessionMeta, raw: string, shownTitle: string) => {
+      setEditingId(null);
+      const title = normalizeSessionTitle(raw);
+      if (!title || title === shownTitle) return;
+      setSessionTitle(session.id, title, true);
+      try {
+        const saved = await saveSessionTitle(session, title);
+        if (saved !== title) setSessionTitle(session.id, saved, true);
+      } catch (error) {
+        const current = useSessionStore.getState().sessions.find((s) => s.id === session.id);
+        if (current?.title === title) {
+          setSessionTitle(session.id, session.title, Boolean(session.titleIsCustom));
+        }
+        setRenameError(error instanceof Error ? error.message : 'Could not rename chat.');
+      }
+    },
+    [setSessionTitle],
+  );
+
   const formatTime = (d: string) =>
     new Date(d).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -313,6 +353,8 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
           [...sessions].reverse().map((session, index) => {
             const num = sessions.length - index;
             const isSelected = session.id === activeSessionId;
+            const isEditing = session.id === editingId;
+            const shownTitle = sessionDisplayTitle(session, num);
 
             return (
               <Box
@@ -335,11 +377,11 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
                   '&:hover': {
                     bgcolor: 'var(--hover-bg)',
                   },
-                  '& .delete-btn': {
+                  '& .delete-btn, & .rename-btn': {
                     opacity: 0,
                     transition: 'opacity 0.12s',
                   },
-                  '&:hover .delete-btn': {
+                  '&:hover .delete-btn, &:hover .rename-btn, & .rename-btn:focus-visible': {
                     opacity: 1,
                   },
                 }}
@@ -379,22 +421,31 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
                         {session.project}
                       </Box>
                     )}
-                    <Typography
-                      variant="body2"
-                      sx={{
-                        fontWeight: isSelected ? 600 : 400,
-                        color: 'var(--text)',
-                        fontSize: '0.84rem',
-                        lineHeight: 1.4,
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        flex: 1,
-                        minWidth: 0,
-                      }}
-                    >
-                      {session.title.startsWith('Chat ') ? `Session ${String(num).padStart(2, '0')}` : session.title}
-                    </Typography>
+                    {isEditing ? (
+                      <SessionTitleEditor
+                        initialTitle={shownTitle}
+                        onCommit={(value) => void commitRename(session, value, shownTitle)}
+                        onCancel={() => setEditingId(null)}
+                      />
+                    ) : (
+                      <Typography
+                        variant="body2"
+                        onDoubleClick={(e) => startRename(session.id, e)}
+                        sx={{
+                          fontWeight: isSelected ? 600 : 400,
+                          color: 'var(--text)',
+                          fontSize: '0.84rem',
+                          lineHeight: 1.4,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          flex: 1,
+                          minWidth: 0,
+                        }}
+                      >
+                        {shownTitle}
+                      </Typography>
+                    )}
                   </Box>
                   {/* Subtitle row: status · message count · time */}
                   <Typography
@@ -429,6 +480,24 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
                       },
                     }}
                   />
+                )}
+
+                {!isEditing && (
+                  <IconButton
+                    className="rename-btn"
+                    size="small"
+                    aria-label="Rename chat"
+                    onClick={(e) => startRename(session.id, e)}
+                    sx={{
+                      color: 'var(--muted-text)',
+                      width: 26,
+                      height: 26,
+                      flexShrink: 0,
+                      '&:hover': { color: 'var(--text)', bgcolor: 'var(--hover-bg)' },
+                    }}
+                  >
+                    <EditOutlinedIcon sx={{ fontSize: 15 }} />
+                  </IconButton>
                 )}
 
                 <IconButton
@@ -506,6 +575,21 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         </Box>
 
       </Box>
+      <Snackbar
+        open={!!renameError}
+        autoHideDuration={4000}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        onClose={() => setRenameError(null)}
+      >
+        <Alert
+          severity="error"
+          variant="filled"
+          onClose={() => setRenameError(null)}
+          sx={{ fontSize: '0.8rem' }}
+        >
+          {renameError}
+        </Alert>
+      </Snackbar>
       {/* Delete confirmation dialog */}
       <Dialog
         open={!!confirmDeleteId}

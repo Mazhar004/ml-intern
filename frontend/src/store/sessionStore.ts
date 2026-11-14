@@ -17,7 +17,11 @@ interface SessionStore {
    *  finished background task stops looking "processing" (which would otherwise
    *  keep reactivating it until the next GET /sessions merge). */
   setSessionProcessing: (id: string, isProcessing: boolean) => void;
+  /** Apply an auto-generated title. No-op for chats the user renamed. */
   updateSessionTitle: (id: string, title: string) => void;
+  /** Set a title and whether it is a user rename (also used to revert a
+   *  failed optimistic rename). */
+  setSessionTitle: (id: string, title: string, titleIsCustom: boolean) => void;
   updateSessionModel: (id: string, model: string | null) => void;
   setNeedsAttention: (id: string, needs: boolean) => void;
   /** Mark a session as expired (backend no longer has it). The UI shows a
@@ -29,6 +33,7 @@ interface SessionStore {
   mergeServerSessions: (sessions: Array<{
     session_id: string;
     title?: string | null;
+    title_is_custom?: boolean;
     created_at: string;
     usage_window_started_at?: string | null;
     is_active?: boolean;
@@ -56,10 +61,29 @@ interface SessionStore {
    *  sidebar so they're visible & clickable. Skips ids already in the store
    *  and marks newly-added ones as expired so the UI shows the recovery
    *  banner — clicking "Catch me up" then triggers a full /api/session/import
-   *  rehydration. Items: {session_id, saved_at, message_count, first_user_preview}. */
-  mergeArchivedSessions: (
-    archived: Array<{ session_id: string; saved_at?: string | null; message_count?: number; first_user_preview?: string }>,
-  ) => void;
+   *  rehydration. Items: {session_id, saved_at, message_count, first_user_preview,
+   *  title, title_is_custom}. */
+  mergeArchivedSessions: (archived: ArchivedSessionRow[]) => void;
+}
+
+interface ArchivedSessionRow {
+  session_id: string;
+  saved_at?: string | null;
+  message_count?: number;
+  first_user_preview?: string;
+  project?: string | null;
+  title?: string | null;
+  title_is_custom?: boolean;
+}
+
+/** A user rename saved on disk wins over the local (preview/auto) title. */
+function withArchivedCustomTitle(
+  session: SessionMeta,
+  archivedById: Map<string, ArchivedSessionRow>,
+): SessionMeta {
+  const row = session.expired ? archivedById.get(session.id) : undefined;
+  if (!row?.title_is_custom || !row.title || row.title === session.title) return session;
+  return { ...session, title: row.title, titleIsCustom: true };
 }
 
 export const useSessionStore = create<SessionStore>()(
@@ -129,9 +153,12 @@ export const useSessionStore = create<SessionStore>()(
             const existing = byId.get(id);
             if (existing) {
               const auto = server.auto_approval;
+              // Keep an optimistic local rename until the server reports it.
+              const keepLocalTitle = existing.titleIsCustom && !server.title_is_custom;
               const updated = {
                 ...existing,
-                title: server.title || existing.title,
+                title: keepLocalTitle ? existing.title : server.title || existing.title,
+                titleIsCustom: Boolean(server.title_is_custom || existing.titleIsCustom),
                 isActive: server.is_active ?? existing.isActive,
                 isProcessing: Boolean(server.is_processing),
                 model: server.model ?? existing.model ?? null,
@@ -156,6 +183,7 @@ export const useSessionStore = create<SessionStore>()(
             const newSession: SessionMeta = {
               id,
               title: server.title || `Chat ${merged.length + 1}`,
+              titleIsCustom: Boolean(server.title && server.title_is_custom),
               createdAt: server.created_at || new Date().toISOString(),
               usageWindowStartedAt: server.usage_window_started_at ?? null,
               isActive: server.is_active ?? true,
@@ -245,7 +273,15 @@ export const useSessionStore = create<SessionStore>()(
       updateSessionTitle: (id: string, title: string) => {
         set((state) => ({
           sessions: state.sessions.map((s) =>
-            s.id === id ? { ...s, title } : s
+            s.id === id && !s.titleIsCustom ? { ...s, title } : s
+          ),
+        }));
+      },
+
+      setSessionTitle: (id: string, title: string, titleIsCustom: boolean) => {
+        set((state) => ({
+          sessions: state.sessions.map((s) =>
+            s.id === id ? { ...s, title, titleIsCustom } : s
           ),
         }));
       },
@@ -269,6 +305,7 @@ export const useSessionStore = create<SessionStore>()(
       mergeArchivedSessions: (archived) => {
         set((state) => {
           const archivedIds = new Set(archived.map((a) => a.session_id).filter(Boolean));
+          const archivedById = new Map(archived.map((a) => [a.session_id, a]));
           // Prune stale rows: any row that was previously an archived/expired
           // entry but is no longer in the disk list — that means the user
           // (or a cleanup script) deleted the file. Without this, stale
@@ -283,7 +320,7 @@ export const useSessionStore = create<SessionStore>()(
             // to a fresh in-memory id but the disk file kept the original.
             if (s.sourceArchiveId && archivedIds.has(s.sourceArchiveId)) return true;
             return false; // stale → drop
-          });
+          }).map((s) => withArchivedCustomTitle(s, archivedById));
           // knownIds includes BOTH the current row id AND its sourceArchiveId
           // (set when "Catch me up" renamed the row). Without this, a reload
           // after Catch me up would re-add the original archive as a NEW
@@ -310,12 +347,14 @@ export const useSessionStore = create<SessionStore>()(
 
           const additions: SessionMeta[] = [];
           for (const a of grouped.values()) {
-            const preview = (a.first_user_preview || '').replace(/\s+/g, ' ').trim();
-            const title = preview ? preview.slice(0, 80) : `Archived session`;
+            const preview = (a.first_user_preview || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+            const title = a.title || preview || `Archived session`;
             const proj = (a as { project?: string }).project;
             additions.push({
               id: a.session_id,
               title,
+              titleIsCustom: Boolean(a.title && a.title_is_custom),
+              archivePreview: preview,
               createdAt: a.saved_at || new Date().toISOString(),
               isActive: false,
               needsAttention: false,
@@ -332,12 +371,14 @@ export const useSessionStore = create<SessionStore>()(
           // archives of the same conversation saved under different session
           // ids across runs would each survive every reload (both files are
           // on disk, so the prune keeps both) and show as duplicate rows.
-          // Collapse rows that share (project + normalized title), keeping the
-          // best representative; rows without a meaningful title key only on
-          // their id so distinct untitled sessions are never merged.
+          // Collapse rows that share (project + normalized preview/title),
+          // keeping the best representative; rows without a meaningful key
+          // (untitled, or a user rename with no archive preview) key only on
+          // their id so distinct sessions are never merged by name.
           const combined = [...prunedSessions, ...additions];
           const dedupKeyOf = (s: SessionMeta): string => {
-            const t = (s.title || '')
+            const basis = s.archivePreview ?? (s.titleIsCustom ? '' : s.title);
+            const t = (basis || '')
               .toLowerCase()
               .replace(/\s+/g, ' ')
               .trim()
@@ -374,11 +415,12 @@ export const useSessionStore = create<SessionStore>()(
             const kept = activeRow ? byKey.get(dedupKeyOf(activeRow)) : undefined;
             activeSessionId = kept ? kept.id : null;
           }
-          // No-op guard: same rows in the same order AND unchanged selection.
+          // No-op guard: same row objects in the same order AND unchanged
+          // selection (a refreshed archived title yields a new row object).
           if (
             activeSessionId === state.activeSessionId &&
             deduped.length === state.sessions.length &&
-            deduped.every((s, i) => s.id === state.sessions[i]?.id)
+            deduped.every((s, i) => s === state.sessions[i])
           ) {
             return state;
           }

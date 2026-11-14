@@ -170,6 +170,7 @@ class MongoSessionStore(NoopSessionStore):
         user_id: str,
         model: str,
         title: str | None = None,
+        title_is_custom: bool = False,
         surface: str = "frontend",
         created_at: datetime | None = None,
         usage_window_started_at: datetime | None = None,
@@ -202,6 +203,7 @@ class MongoSessionStore(NoopSessionStore):
                 },
                 "$set": {
                     "title": title,
+                    "title_is_custom": title_is_custom,
                     "model": model,
                     "usage_window_started_at": (
                         usage_window_started_at or created_at or now
@@ -232,6 +234,7 @@ class MongoSessionStore(NoopSessionStore):
         model: str,
         messages: list[dict[str, Any]],
         title: str | None = None,
+        title_is_custom: bool = False,
         runtime_state: str = "idle",
         status: str = "active",
         turn_count: int = 0,
@@ -256,6 +259,7 @@ class MongoSessionStore(NoopSessionStore):
             user_id=user_id,
             model=model,
             title=title,
+            title_is_custom=title_is_custom,
             created_at=created_at,
             runtime_state=runtime_state,
             status=status,

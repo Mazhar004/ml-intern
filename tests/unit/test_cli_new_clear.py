@@ -60,6 +60,8 @@ def test_start_new_conversation_rotates_session_state(monkeypatch):
     session._local_save_path = "session_logs/old.json"
     session.pending_approval = {"tool_calls": ["pending"]}
     session.auto_approval_estimated_spend_usd = 1.25
+    session.title = "Old chat"
+    session.title_is_custom = True
     session.current_plan = [
         {"id": "old-session", "content": "old session item", "status": "pending"}
     ]
@@ -93,6 +95,8 @@ def test_start_new_conversation_rotates_session_state(monkeypatch):
     assert session._local_save_path is None
     assert session.pending_approval is None
     assert session.auto_approval_estimated_spend_usd == 0.0
+    assert session.title is None
+    assert session.title_is_custom is False
     assert session.current_plan == []
     assert plan_tool.get_current_plan() == []
 

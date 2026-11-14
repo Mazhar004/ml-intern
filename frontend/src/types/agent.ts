@@ -13,6 +13,14 @@ export interface MessageMeta {
 export interface SessionMeta {
   id: string;
   title: string;
+  /** True once the user renamed this chat. Auto-titling never overwrites a
+   *  custom title, and the "Chat N" → "Session NN" display fallback is
+   *  skipped for it. Mirrors the backend's ``title_is_custom``. */
+  titleIsCustom?: boolean;
+  /** First-user-message preview for rows hydrated from
+   *  /api/sessions/archived. Used as the de-dup key instead of the
+   *  (renamable) title so renaming never splits or merges archive groups. */
+  archivePreview?: string;
   createdAt: string;
   usageWindowStartedAt?: string | null;
   isActive: boolean;

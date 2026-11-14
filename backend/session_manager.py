@@ -138,6 +138,8 @@ class AgentSession:
     is_reaping: bool = False
     broadcaster: Any = None
     title: str | None = None
+    # True once the user renamed the chat; auto-titling must not overwrite it.
+    title_is_custom: bool = False
     usage_window_started_at: datetime | None = None
     inference_billing_session_id: str | None = None
     usage_warning_next_threshold_usd: float = USAGE_WARNING_FIRST_THRESHOLD_USD
@@ -157,6 +159,24 @@ class AgentSession:
             self.session.inference_billing_session_id = (
                 self.inference_billing_session_id
             )
+        except AttributeError:
+            pass
+        self._sync_title_to_runtime()
+
+    def set_title(self, title: str | None, *, is_custom: bool) -> None:
+        """Update the sidebar title here and on the runtime session.
+
+        The runtime session writes it into every session_logs/ save, which is
+        what keeps the title durable when no Mongo store is configured.
+        """
+        self.title = title
+        self.title_is_custom = is_custom
+        self._sync_title_to_runtime()
+
+    def _sync_title_to_runtime(self) -> None:
+        try:
+            self.session.title = self.title
+            self.session.title_is_custom = self.title_is_custom
         except AttributeError:
             pass
 
@@ -1036,6 +1056,7 @@ class SessionManager:
                 user_id=agent_session.user_id,
                 model=agent_session.session.config.model_name,
                 title=agent_session.title,
+                title_is_custom=agent_session.title_is_custom,
                 messages=self._serialize_messages(agent_session.session),
                 runtime_state=runtime_state or self._runtime_state(agent_session),
                 status=status,
@@ -1253,6 +1274,7 @@ class SessionManager:
             is_active=True,
             is_processing=False,
             title=meta.get("title"),
+            title_is_custom=bool(meta.get("title_is_custom")),
         )
         self._install_usage_threshold_checker(agent_session)
         self._install_yolo_budget_checker(agent_session)
@@ -1951,12 +1973,36 @@ class SessionManager:
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
         return True
 
-    async def update_session_title(self, session_id: str, title: str | None) -> None:
-        """Persist a user-visible title for sidebar rehydration."""
+    async def update_session_title(
+        self, session_id: str, title: str | None
+    ) -> str | None:
+        """Persist an auto-generated title for sidebar rehydration.
+
+        A title the user set by renaming always wins: it is returned unchanged
+        and nothing is written. Returns the title the session ends up with.
+        """
         agent_session = self.sessions.get(session_id)
+        if agent_session and agent_session.title_is_custom:
+            return agent_session.title
         if agent_session:
-            agent_session.title = title
+            agent_session.set_title(title, is_custom=False)
         await self._store().update_session_fields(session_id, title=title)
+        return title
+
+    async def set_custom_session_title(self, session_id: str, title: str) -> str | None:
+        """Apply a user rename to a live session and the session store.
+
+        Every later session_logs/ auto-save carries it via the runtime
+        session. Returns None when the session isn't loaded in this process.
+        """
+        agent_session = self.sessions.get(session_id)
+        if agent_session is None:
+            return None
+        agent_session.set_title(title, is_custom=True)
+        await self._store().update_session_fields(
+            session_id, title=title, title_is_custom=True
+        )
+        return title
 
     async def update_session_model(self, session_id: str, model_id: str) -> bool:
         agent_session = self.sessions.get(session_id)
@@ -2064,6 +2110,7 @@ class SessionManager:
             "model": agent_session.session.config.model_name,
             "project": project_name,
             "title": agent_session.title,
+            "title_is_custom": agent_session.title_is_custom,
             "notification_destinations": list(
                 agent_session.session.notification_destinations
             ),
@@ -2186,6 +2233,7 @@ class SessionManager:
                         "pending_approval": pending or None,
                         "model": row.get("model"),
                         "title": row.get("title"),
+                        "title_is_custom": bool(row.get("title_is_custom")),
                         "notification_destinations": row.get(
                             "notification_destinations"
                         )

@@ -95,9 +95,11 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
       setSessionProcessing(sessionId, true);
       sendMessage({ text: text.trim(), metadata: { createdAt: new Date().toISOString() } });
 
-      // Auto-title the session from the first user message
+      // Auto-title the session from the first user message — unless the user
+      // already renamed it (updateSessionTitle also ignores renamed chats, so
+      // a rename made while this request is in flight still wins).
       const isFirstMessage = messages.filter((m) => m.role === 'user').length === 0;
-      if (isFirstMessage) {
+      if (isFirstMessage && !sessionMeta?.titleIsCustom) {
         apiFetch('/api/title', {
           method: 'POST',
           body: JSON.stringify({ session_id: sessionId, text: text.trim() }),
@@ -112,7 +114,16 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
           });
       }
     },
-    [sessionId, sendMessage, messages, updateSessionTitle, busy, updateSession, setSessionProcessing],
+    [
+      sessionId,
+      sendMessage,
+      messages,
+      updateSessionTitle,
+      busy,
+      updateSession,
+      setSessionProcessing,
+      sessionMeta?.titleIsCustom,
+    ],
   );
 
   // Don't render UI for background sessions — hooks still run
