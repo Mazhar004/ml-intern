@@ -27,9 +27,10 @@ export interface SessionMeta {
   needsAttention: boolean;
   model?: string | null;
   /** True when the backend reports this session is mid-turn (from
-   *  GET /sessions). A processing session is already live in memory, so it
-   *  keeps streaming in the background; idle sessions are NOT hydrated on app
-   *  load, which is what keeps them from refilling the active-session pool.
+   *  GET /sessions). Sidebar status only: background sessions — processing
+   *  or not — are NOT hydrated or streamed (only the active one is), which
+   *  keeps them from refilling the active-session pool and from holding the
+   *  browser's per-origin connections.
    *  Transient — never persisted to localStorage (always re-derived from the
    *  server list). */
   isProcessing?: boolean;

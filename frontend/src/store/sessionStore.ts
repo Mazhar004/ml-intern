@@ -14,8 +14,8 @@ interface SessionStore {
   switchSession: (id: string) => void;
   setSessionActive: (id: string, isActive: boolean) => void;
   /** Track whether this session is mid-turn. Set false on terminal events so a
-   *  finished background task stops looking "processing" (which would otherwise
-   *  keep reactivating it until the next GET /sessions merge). */
+   *  finished task stops looking "processing" (which would otherwise last
+   *  until the next GET /sessions merge). */
   setSessionProcessing: (id: string, isProcessing: boolean) => void;
   /** Apply an auto-generated title. No-op for chats the user renamed. */
   updateSessionTitle: (id: string, title: string) => void;

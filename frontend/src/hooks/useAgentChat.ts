@@ -28,8 +28,6 @@ const YOLO_BUDGET_TOOL_NAME = 'yolo_budget';
 interface UseAgentChatOptions {
   sessionId: string;
   isActive: boolean;
-  /** Backend reports this session is mid-turn (from the GET /sessions list). */
-  isProcessing?: boolean;
   onReady?: () => void;
   onError?: (error: string) => void;
   onSessionDead?: (sessionId: string) => void;
@@ -84,21 +82,23 @@ function waitingApprovalStatus(items: PendingApprovalItem[] | undefined) {
   };
 }
 
-export function useAgentChat({ sessionId, isActive, isProcessing = false, onReady, onError, onSessionDead }: UseAgentChatOptions) {
+export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionDead }: UseAgentChatOptions) {
   const callbacksRef = useRef({ onReady, onError, onSessionDead });
   callbacksRef.current = { onReady, onError, onSessionDead };
 
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
 
-  // Only the active tab — or a session the backend says is mid-turn — gets a
-  // reactivating hydration (the /messages + /session fetch and the SDK's
-  // resume reconnect both call ensure_session_loaded, which spins a runtime +
+  // Only the active tab gets a reactivating hydration (the /messages +
+  // /session fetch calls ensure_session_loaded, which spins a runtime +
   // sandbox back up for any not-currently-live session). Gating on this keeps
   // app load from reactivating every historical session and refilling the
-  // global active-session pool. A processing session is already live, so
-  // hydrating it returns the existing object without inflating the pool.
-  const shouldReactivate = isActive || isProcessing;
+  // global active-session pool. Background sessions — even ones the backend
+  // reports mid-turn — stay dormant too: every live stream/poll holds one of
+  // the browser's 6 per-origin connections (shared by all tabs), so a few
+  // busy background chats starved every other request. Their sidebar status
+  // comes from the GET /sessions list; they hydrate once when opened.
+  const shouldReactivate = isActive;
   const shouldReactivateRef = useRef(shouldReactivate);
   shouldReactivateRef.current = shouldReactivate;
 
@@ -127,9 +127,9 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
     () => ({
       onReady: () => {
         // Mirror to the sidebar store too: agentStore drives the live UI, but
-        // SessionMeta.isProcessing (sessionStore) is what feeds shouldReactivate.
-        // Only mergeServerSessions sets it, so without clearing it here a
-        // finished background task keeps reactivating until the next list fetch.
+        // SessionMeta.isProcessing (sessionStore) is the sidebar's status.
+        // Otherwise only mergeServerSessions sets it, so without clearing it
+        // here a finished task looks "processing" until the next list fetch.
         setProcessingState(false);
         if (isActiveRef.current) {
           useAgentStore.getState().setConnected(true);
@@ -290,8 +290,8 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
         // Approval pauses the turn: the backend has returned and set
         // is_processing=False, and no turn_complete/onProcessingDone fires on
         // this path. Clear processing in both stores (sessionStore.isProcessing
-        // feeds shouldReactivate) so a backgrounded waiting-approval session
-        // doesn't stay "processing" until the next /sessions merge —
+        // is the sidebar status) so a waiting-approval session doesn't stay
+        // "processing" until the next /sessions merge —
         // activityStatus still surfaces the waiting-approval state.
         setProcessingState(false, { activityStatus: waitingApprovalStatus(pendingItems) });
         refreshUsage();
@@ -548,12 +548,11 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
     messages: initialMessages,
     transport: transportRef.current!,
     experimental_throttle: 80,
-    // On mount, the SDK calls transport.reconnectToStream() which checks
-    // is_processing and subscribes to the live event stream if the agent
-    // is mid-turn.  Without this, page refresh kills live updates. Gated on
-    // shouldReactivate so an idle backgrounded session isn't reactivated on
-    // app load just to find there's nothing to resume.
-    resume: shouldReactivate,
+    // No SDK resume: its reconnect stream (transport.reconnectToStream) can't
+    // be aborted when the session goes to the background, and it would run
+    // alongside the live-sync stream below. Live sync (hydrate + GET
+    // /api/events + poll) covers page refresh for the active session instead.
+    resume: false,
     // After all approval responses are set, auto-send to continue the agent loop.
     // Without this, addToolApprovalResponse only updates the UI — it won't trigger
     // sendMessages on the transport.
@@ -571,12 +570,15 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
   chatActionsRef.current.setMessages = chat.setMessages;
   chatActionsRef.current.messages = chat.messages;
 
+  // -- Live sync handle (set by the wake/live-sync effect below) ----------
+  const startLiveSyncRef = useRef<(() => void) | null>(null);
+
   // -- Hydrate from backend on mount (page refresh recovery) --------------
-  // Gated on shouldReactivate: an idle backgrounded session renders from its
+  // Gated on shouldReactivate: a backgrounded session renders from its
   // localStorage message cache + the sidebar list payload, with no per-session
   // fetch that would reactivate its runtime/sandbox. Re-runs when a session
-  // becomes active (user selects it) or the list reports it processing, which
-  // is exactly when reactivation is wanted.
+  // becomes active (user selects it), which is exactly when reactivation is
+  // wanted — and one-shot hydrates a task that finished in the background.
   useEffect(() => {
     if (!shouldReactivate) return;
     let cancelled = false;
@@ -647,6 +649,9 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
               researchStats: savedResearch.stats,
             }),
           });
+          // Mid-turn on activation (page load or switch-in): subscribe to live
+          // events + poll while this session stays active.
+          if (!cancelled) startLiveSyncRef.current?.();
         } else if (pendingIds && pendingIds.size > 0) {
           setProcessingState(false, { activityStatus: waitingApprovalStatus(pendingItems) });
           clearResearch(sessionId);
@@ -661,10 +666,11 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
     return () => { cancelled = true; };
   }, [sessionId, shouldReactivate, setProcessingState]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // -- Re-hydrate + reconnect on wake from sleep ----------------------------
-  // The Vercel AI SDK only calls reconnectToStream() on mount, NOT on
-  // visibility change.  So when the browser wakes from sleep and the SSE
-  // stream is dead, we must manually:
+  // -- Live sync: activation + re-hydrate/reconnect on wake from sleep -------
+  // Only the ACTIVE session runs this (the effect is torn down — stream
+  // aborted, poll cleared — as soon as it goes to the background). When the
+  // active session is mid-turn on activation (hydration effect above) or when
+  // the browser wakes and the SSE stream is dead, we must manually:
   //   1. Re-hydrate messages (one-shot fetch from backend)
   //   2. Subscribe to live events via GET /api/events/{sessionId}
   //   3. Pipe those events through the side-channel callbacks for real-time UI
@@ -854,16 +860,53 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
       }
     };
 
+    /** Subscribe to live events + poll messages (replaces any previous run). */
+    const startLiveSync = () => {
+      // Stop any previous reconnection — never two event streams per session
+      stopReconnect();
+
+      // Start live event subscription
+      const abort = new AbortController();
+      reconnectAbortRef.current = abort;
+      consumeEventStream(abort.signal);
+
+      // Poll messages every 3 s so the chat message list stays up-to-date
+      // (the event stream gives us real-time status but not full message diffs)
+      pollTimerRef.current = setInterval(async () => {
+        const fresh = await hydrateMessages();
+        // Superseded or torn down (session went to the background) mid-fetch
+        if (!fresh || abort.signal.aborted) return;
+        const msgs = llmMessagesToUIMessages(
+          fresh.data,
+          fresh.pendingIds,
+          chatActionsRef.current.messages,
+          fresh.pendingItems,
+        );
+
+        const currentCount = chatActionsRef.current.messages.length;
+        if (msgs.length > currentCount || currentCount === 0) {
+          chat.setMessages(msgs);
+          saveMessages(sessionId, msgs);
+        }
+
+        // If backend stopped processing, clean up
+        if (fresh.info && !fresh.info.is_processing) {
+          setProcessingState(false);
+          stopReconnect();
+        }
+      }, 3000);
+    };
+
     const onVisible = async () => {
       if (document.visibilityState !== 'visible') return;
-      // Idle backgrounded sessions stay dormant on tab refocus too — otherwise
-      // every refocus would re-hydrate (and reactivate) every session, refilling
-      // the pool the reaper just drained. Only the active/processing session wakes.
+      // Background sessions stay dormant on tab refocus too — otherwise every
+      // refocus would re-hydrate (and reactivate) every session, refilling the
+      // pool the reaper just drained. Only the active session wakes.
       if (!shouldReactivateRef.current) return;
 
       // Always re-hydrate messages on wake
       const result = await hydrateMessages();
-      if (!result) return;
+      if (!result || !isActiveRef.current) return;
 
       const { data, pendingIds, pendingItems, info } = result;
       const uiMsgs = llmMessagesToUIMessages(
@@ -880,48 +923,18 @@ export function useAgentChat({ sessionId, isActive, isProcessing = false, onRead
       // If the backend is still processing, reconnect to the live event stream
       if (info?.is_processing) {
         setProcessingState(true, { activityStatus: { type: 'thinking' } });
-
-        // Stop any previous reconnection
-        stopReconnect();
-
-        // Start live event subscription
-        const abort = new AbortController();
-        reconnectAbortRef.current = abort;
-        consumeEventStream(abort.signal);
-
-        // Poll messages every 3 s so the chat message list stays up-to-date
-        // (the event stream gives us real-time status but not full message diffs)
-        pollTimerRef.current = setInterval(async () => {
-          const fresh = await hydrateMessages();
-          if (!fresh) return;
-          const msgs = llmMessagesToUIMessages(
-            fresh.data,
-            fresh.pendingIds,
-            chatActionsRef.current.messages,
-            fresh.pendingItems,
-          );
-
-          const currentCount = chatActionsRef.current.messages.length;
-          if (msgs.length > currentCount || currentCount === 0) {
-            chat.setMessages(msgs);
-            saveMessages(sessionId, msgs);
-          } 
-
-          // If backend stopped processing, clean up
-          if (fresh.info && !fresh.info.is_processing) {
-            setProcessingState(false);
-            stopReconnect();
-          }
-        }, 3000);
+        startLiveSync();
       }
     };
 
+    if (isActive) startLiveSyncRef.current = startLiveSync;
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
+      if (startLiveSyncRef.current === startLiveSync) startLiveSyncRef.current = null;
       stopReconnect();
     };
-  }, [sessionId, setProcessingState]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionId, isActive, setProcessingState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // -- Persist messages ---------------------------------------------------
   const prevMessagesSignatureRef = useRef(messagesSignature(initialMessages));
