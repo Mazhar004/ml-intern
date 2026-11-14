@@ -8,6 +8,7 @@ subprocess/pathlib instead of going through a remote sandbox.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -206,7 +207,12 @@ async def _bash_handler(
         env["PROJECT_ROOT"] = str(root)
 
     try:
-        result = subprocess.run(
+        # Run in a worker thread: in local mode this handler executes inside
+        # the web backend, and a blocking call here would freeze every HTTP
+        # endpoint (health, chat stream, Stop) for the whole command, which
+        # can be hours for a foreground `sleep` or training run.
+        result = await asyncio.to_thread(
+            subprocess.run,
             command,
             shell=True,
             capture_output=True,
