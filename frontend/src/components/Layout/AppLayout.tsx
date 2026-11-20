@@ -2,7 +2,9 @@ import { useCallback, useRef, useEffect, useState } from 'react';
 import {
   Avatar,
   Box,
+  CircularProgress,
   Drawer,
+  Fade,
   Typography,
   IconButton,
   Alert,
@@ -27,6 +29,7 @@ import CodePanel from '@/components/CodePanel/CodePanel';
 import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
 import UsageMeter from '@/components/UsageMeter';
+import { useServerSessionHydration } from '@/hooks/useServerSessionHydration';
 import { apiFetch } from '@/utils/api';
 import {
   creditCtaForModel,
@@ -34,13 +37,15 @@ import {
   isInferenceCreditError,
   usesProviderNotices,
 } from '@/utils/inferenceBilling';
-import { loadBackendMessages } from '@/lib/backend-message-store';
-import { loadMessages } from '@/lib/chat-message-store';
 
 const DRAWER_WIDTH = 260;
 
 export default function AppLayout() {
-  const { sessions, activeSessionId, markExpired, deleteSession } = useSessionStore();
+  // resolveDeadSession: the backend lost a chat (404). The store keeps it for
+  // Catch me up, or drops it when it is a fresh live chat with nothing to restore.
+  const { sessions, activeSessionId, resolveDeadSession } = useSessionStore();
+  // Loaded here, not in the sidebar: this component is always mounted.
+  const { initialLoadPending } = useServerSessionHydration();
   const { isConnected, llmHealthError, setLlmHealthError, user } = useAgentStore();
   const {
     isLeftSidebarOpen,
@@ -165,33 +170,6 @@ export default function AppLayout() {
     return () => window.removeEventListener('pagehide', teardownSandboxes);
   }, []);
 
-  const handleSessionDead = useCallback(
-    (deadSessionId: string) => {
-      // Backend lost this session (e.g. after a restart/rebuild). Decide
-      // between "offer recovery" and "drop silently" based on whether there
-      // is anything to recover, so users aren't greeted by a scary
-      // "nothing to restore" banner for an empty, never-persisted session.
-      const hasClientCache =
-        loadBackendMessages(deadSessionId).length > 0 ||
-        loadMessages(deadSessionId).length > 0;
-      if (hasClientCache) {
-        // Real conversation cached in the browser — mark expired so the chat
-        // shows the recovery banner. "Catch me up" restores losslessly from
-        // session_logs/ if present, else summarizes from the cache.
-        markExpired(deadSessionId);
-      } else {
-        // No cached turns: this session never produced recoverable content
-        // (the typical case is the freshly-created session that was active
-        // when the server restarted). Drop the dead row instead of alarming
-        // the user. This only removes the local sidebar entry + (empty)
-        // localStorage caches — it never deletes a session_logs/ file, so any
-        // on-disk session resurfaces via /api/sessions/archived on next load.
-        deleteSession(deadSessionId);
-      }
-    },
-    [markExpired, deleteSession],
-  );
-
   // Close sidebar on mobile after selecting a session
   const handleSidebarClose = useCallback(() => {
     if (isMobile) setLeftSidebarOpen(false);
@@ -232,11 +210,13 @@ export default function AppLayout() {
     }).catch(() => {});
   };
 
-  // -- Welcome screen: no sessions at all ---------------------------------
+  // -- Welcome screen: no chats here or on the server -----------------------
+  // A browser with no local chats waits for the server's lists first, so
+  // saved chats open in the normal layout instead of behind WelcomeScreen.
   if (!hasAnySessions) {
     return (
       <Box sx={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
-        <WelcomeScreen />
+        {initialLoadPending ? <ChatListLoading /> : <WelcomeScreen />}
       </Box>
     );
   }
@@ -400,7 +380,7 @@ export default function AppLayout() {
                   key={s.id}
                   sessionId={s.id}
                   isActive={s.id === activeSessionId}
-                  onSessionDead={handleSessionDead}
+                  onSessionDead={resolveDeadSession}
                 />
               ))
             ) : (
@@ -552,6 +532,26 @@ export default function AppLayout() {
           )}
         </Alert>
       </Snackbar>
+    </Box>
+  );
+}
+
+/** A browser with no local chats waits here for the server's chat lists. */
+function ChatListLoading() {
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'var(--body-gradient)',
+      }}
+    >
+      {/* Delayed, so a quick load shows no spinner at all. */}
+      <Fade in style={{ transitionDelay: '400ms' }}>
+        <CircularProgress size={28} aria-label="Loading chats" sx={{ color: 'var(--muted-text)' }} />
+      </Fade>
     </Box>
   );
 }

@@ -1,14 +1,30 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type { SessionMeta } from '@/types/agent';
-import { deleteMessages, moveMessages } from '@/lib/chat-message-store';
-import { moveBackendMessages, deleteBackendMessages } from '@/lib/backend-message-store';
+import {
+  cachedMessageSessionIds,
+  deleteMessages,
+  moveMessages,
+} from '@/lib/chat-message-store';
+import {
+  cachedBackendSessionIds,
+  deleteBackendMessages,
+  moveBackendMessages,
+} from '@/lib/backend-message-store';
 import { safeLocalStorage, setActiveSessionSource } from '@/lib/safeStorage';
+import { deadSessionAction } from '@/utils/deadSession';
 import { normalizeProjectName } from '@/utils/sessionGroups';
 
 interface SessionStore {
   sessions: SessionMeta[];
   activeSessionId: string | null;
+  /** Ids from the last successful GET /api/sessions/archived (chats saved on
+   *  disk), or null until that list loads. Per page load: never persisted. */
+  archivedSessionIds: ReadonlySet<string> | null;
+  /** True once this page load has merged both server lists (GET /api/sessions
+   *  and /api/sessions/archived). Until then the sidebar keeps a remembered
+   *  project filter whose group has not shown up yet. Never persisted. */
+  serverListsMerged: boolean;
 
   // Actions
   /** `project` is the folder picked in New Task (blank or omitted: none). */
@@ -69,6 +85,15 @@ interface SessionStore {
    *  rehydration. Items: {session_id, saved_at, message_count, first_user_preview,
    *  title, title_is_custom}. */
   mergeArchivedSessions: (archived: ArchivedSessionRow[]) => void;
+  /** Record the ids a successful GET /api/sessions/archived returned. */
+  setArchivedSessionIds: (ids: readonly string[]) => void;
+  setServerListsMerged: (merged: boolean) => void;
+  /** The backend has no session for this chat (it answered 404). Keeps the
+   *  row, marked expired so its banner offers Catch me up, whenever it has or
+   *  may have something to restore (see utils/deadSession.ts); deletes only a
+   *  fresh live chat with nothing to restore. Never touches a session_logs/
+   *  file. Ids not in the list are ignored. */
+  resolveDeadSession: (id: string) => void;
 }
 
 interface ArchivedSessionRow {
@@ -104,11 +129,40 @@ function withArchivedProject(
   return project ? { ...session, project } : session;
 }
 
+/** Ids of the chats whose messages this browser still caches (either cache). */
+function cachedMessageIds(): Set<string> {
+  return new Set([...cachedBackendSessionIds(), ...cachedMessageSessionIds()]);
+}
+
+/** The browser still caches messages for this chat (in either cache). */
+function hasCachedMessages(id: string): boolean {
+  return cachedMessageIds().has(id);
+}
+
+/**
+ * The chat to open after the open one is deleted: the last live (not
+ * expired) row, which is the most recently added one because new chats are
+ * appended; else the last row; else none. Store order, not createdAt: the
+ * rows mix UTC ("...Z"), naive UTC and naive local times, which don't
+ * compare. A saved chat is never live in the backend, so opening one would
+ * only 404.
+ */
+function nextActiveSessionId(sessions: readonly SessionMeta[]): string | null {
+  const live = sessions.filter((s) => !s.expired);
+  return (live[live.length - 1] ?? sessions[sessions.length - 1])?.id ?? null;
+}
+
+function sameMembers(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every((id) => b.has(id));
+}
+
 export const useSessionStore = create<SessionStore>()(
   persist(
     (set, get) => ({
       sessions: [],
       activeSessionId: null,
+      archivedSessionIds: null,
+      serverListsMerged: false,
 
       createSession: (id: string, model?: string | null, project?: string | null) => {
         const now = new Date().toISOString();
@@ -139,7 +193,7 @@ export const useSessionStore = create<SessionStore>()(
           const newSessions = state.sessions.filter((s) => s.id !== id);
           const newActiveId =
             state.activeSessionId === id
-              ? newSessions[newSessions.length - 1]?.id || null
+              ? nextActiveSessionId(newSessions)
               : state.activeSessionId;
           return {
             sessions: newSessions,
@@ -149,9 +203,33 @@ export const useSessionStore = create<SessionStore>()(
       },
 
       markExpired: (id: string) => {
+        // Already expired or not listed: nothing changes, so skip the write.
+        if (!get().sessions.some((s) => s.id === id && !s.expired)) return;
         set((state) => ({
           sessions: state.sessions.map((s) => (s.id === id ? { ...s, expired: true } : s)),
         }));
+      },
+
+      resolveDeadSession: (id: string) => {
+        const { sessions, archivedSessionIds, markExpired, deleteSession } = get();
+        const row = sessions.find((s) => s.id === id);
+        const action = deadSessionAction(row, {
+          hasClientCache: row !== undefined && hasCachedMessages(id),
+          archivedSessionIds,
+        });
+        if (action === 'keep') markExpired(id);
+        if (action === 'drop') deleteSession(id);
+      },
+
+      setArchivedSessionIds: (ids: readonly string[]) => {
+        const next = new Set(ids);
+        const current = get().archivedSessionIds;
+        if (current && sameMembers(current, next)) return;
+        set({ archivedSessionIds: next });
+      },
+
+      setServerListsMerged: (merged: boolean) => {
+        if (get().serverListsMerged !== merged) set({ serverListsMerged: merged });
       },
 
       clearExpired: (id: string) => {
@@ -221,10 +299,10 @@ export const useSessionStore = create<SessionStore>()(
             merged.push(newSession);
             byId.set(id, newSession);
           }
-          return {
-            sessions: merged,
-            activeSessionId: state.activeSessionId || merged[merged.length - 1]?.id || null,
-          };
+          // Merging never opens a chat: with none open, the user picks one.
+          // Opening the last row made a fresh browser open an arbitrary chat
+          // (restored with a sandbox on a Mongo-backed backend).
+          return { sessions: merged };
         });
       },
 
@@ -328,12 +406,18 @@ export const useSessionStore = create<SessionStore>()(
         set((state) => {
           const archivedIds = new Set(archived.map((a) => a.session_id).filter(Boolean));
           const archivedById = new Map(archived.map((a) => [a.session_id, a]));
-          // Prune stale rows: any row that was previously an archived/expired
-          // entry but is no longer in the disk list — that means the user
-          // (or a cleanup script) deleted the file. Without this, stale
-          // localStorage entries keep zombie-resurrecting on every reload.
-          // Live in-memory sessions (expired: false) are left alone — they
-          // come from /api/sessions, not /api/sessions/archived.
+          // Prune stale rows: an expired row that is no longer in the disk
+          // list (the user or a cleanup script deleted the file) and has
+          // nothing cached in this browser. Without this, stale localStorage
+          // entries keep zombie-resurrecting on every reload. Live in-memory
+          // sessions (expired: false) are left alone — they come from
+          // /api/sessions, not /api/sessions/archived.
+          // The caches are read at most once, and only if a row is about to go.
+          let cachedIds: ReadonlySet<string> | null = null;
+          const isCached = (id: string): boolean => {
+            if (cachedIds === null) cachedIds = cachedMessageIds();
+            return cachedIds.has(id);
+          };
           const prunedSessions = state.sessions.filter((s) => {
             if (!s.expired) return true;            // active local row, keep
             if (archivedIds.has(s.id)) return true; // still on disk, keep
@@ -341,6 +425,11 @@ export const useSessionStore = create<SessionStore>()(
             // covers the Catch-me-up case where the local id was renamed
             // to a fresh in-memory id but the disk file kept the original.
             if (s.sourceArchiveId && archivedIds.has(s.sourceArchiveId)) return true;
+            // The disk list leaves out short chats (under 10 messages, or no
+            // assistant reply), so a missing row may still be on disk. Keep
+            // it while this browser caches its messages: Catch me up can
+            // restore it from that cache.
+            if (isCached(s.id)) return true;
             return false; // stale → drop
           }).map((s) => withArchivedProject(withArchivedCustomTitle(s, archivedById), archivedById));
           // knownIds includes BOTH the current row id AND its sourceArchiveId
@@ -393,25 +482,21 @@ export const useSessionStore = create<SessionStore>()(
           // archives of the same conversation saved under different session
           // ids across runs would each survive every reload (both files are
           // on disk, so the prune keeps both) and show as duplicate rows.
-          // Collapse rows that share (project + normalized preview/title),
-          // keeping the best representative; rows without a meaningful key
-          // (untitled, or a user rename with no archive preview) key only on
-          // their id so distinct sessions are never merged by name.
+          // Only rows that came from disk (they carry archivePreview, also
+          // after Catch me up) collapse, on (project + normalized preview),
+          // keeping the best representative. Every other row keys on its id:
+          // two different chats can share a title ("Chat 3", or the same auto
+          // title), and keying them on it hid one of them on every load.
           const combined = [...prunedSessions, ...additions];
           const dedupKeyOf = (s: SessionMeta): string => {
-            const basis = s.archivePreview ?? (s.titleIsCustom ? '' : s.title);
-            const t = (basis || '')
+            if (s.archivePreview === undefined) return `id::${s.id}`;
+            const t = s.archivePreview
               .toLowerCase()
               .replace(/\s+/g, ' ')
               .trim()
               .slice(0, 60);
             if (!t || t === 'archived session') return `id::${s.id}`;
-            // Only archive rows key on their project. Live rows carry one too
-            // (for the sidebar's project groups), but keying on it would fold
-            // a live chat into an unrelated archived chat of that project
-            // whose first message matches the live chat's title.
-            const project = s.archivePreview === undefined ? '' : s.project || '';
-            return `${project}::${t}`;
+            return `${s.project || ''}::${t}`;
           };
           // Pick the best representative of a duplicate group: a live
           // (in-memory) session always beats an archive; otherwise keep the
@@ -459,6 +544,8 @@ export const useSessionStore = create<SessionStore>()(
       name: 'hf-agent-sessions',
       // A full localStorage must not make actions like createSession throw.
       storage: createJSONStorage(() => safeLocalStorage),
+      // Persist only these two: archivedSessionIds and serverListsMerged
+      // describe this page load's server lists.
       partialize: (state) => ({
         // Reset transient processing so cold-load state is re-derived from
         // the live GET /sessions list.

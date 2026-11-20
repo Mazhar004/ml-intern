@@ -42,6 +42,14 @@ export function loadMessages(sessionId: string): UIMessage[] {
   return messages;
 }
 
+/** Ids of the sessions with at least one cached message, in one read. */
+export function cachedMessageSessionIds(): Set<string> {
+  const map = readAll();
+  return new Set(
+    Object.keys(map).filter((id) => Array.isArray(map[id]) && map[id].length > 0),
+  );
+}
+
 export function saveMessages(sessionId: string, messages: UIMessage[]): void {
   const map = readAll();
   // Re-insert so key order stays least recently written first.

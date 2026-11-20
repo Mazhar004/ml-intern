@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -44,13 +44,16 @@ interface SessionSidebarProps {
 }
 
 export default function SessionSidebar({ onClose }: SessionSidebarProps) {
+  // The server's chat lists are loaded into the store by
+  // useServerSessionHydration (AppLayout); serverListsMerged turns true once
+  // both have been merged this page load.
   const {
     sessions,
     activeSessionId,
+    serverListsMerged,
     createSession,
     deleteSession,
     switchSession,
-    mergeArchivedSessions,
     mergeServerSessions,
     setSessionTitle,
   } =
@@ -61,8 +64,6 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
   const clearPanel = useAgentStore((s) => s.clearPanel);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [capacityError, setCapacityError] = useState<string | null>(null);
-  // Set once the mount-time server merges below have finished (or failed).
-  const [serverListsMerged, setServerListsMerged] = useState(false);
 
   // -- Project groups + filter ----------------------------------------------
   // Rows keep the flat list's order (newest added first) inside each group.
@@ -112,44 +113,6 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     (project: string) => revealGroup(projectGroupKey(normalizeProjectName(project))),
     [revealGroup],
   );
-
-  // -- Hydrate the sidebar on mount ----------------------------------------
-  // Two sources, merged: (1) /api/sessions — live/durable sessions the
-  // backend currently knows about (shown as active, clickable rows);
-  // (2) /api/sessions/archived — every session_logs/<uuid>_*.json on disk,
-  // including ones from another browser, created via curl, or saved before
-  // this browser's localStorage was populated. Archived rows show as
-  // "needs a catch-up"; clicking one + Catch me up runs /api/session/import
-  // for a full restore. Server sessions are merged first so the archived
-  // pass de-dupes against them and never adds a duplicate live row.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const response = await apiFetch('/api/sessions');
-        if (response.ok) {
-          const live = await response.json();
-          if (!cancelled && Array.isArray(live)) mergeServerSessions(live);
-        }
-      } catch {
-        /* live listing is best-effort; archived + local metadata still work */
-      }
-      try {
-        const res = await apiFetch('/api/sessions/archived');
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled || !Array.isArray(data)) return;
-        mergeArchivedSessions(data);
-      } catch {
-        // best-effort: archived listing is a convenience, not load-bearing
-      }
-    })().finally(() => {
-      if (!cancelled) setServerListsMerged(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [mergeArchivedSessions, mergeServerSessions]);
 
   // -- Handlers -----------------------------------------------------------
 
@@ -331,7 +294,12 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
 
   const handleSelect = useCallback(
     (sessionId: string) => {
-      const shouldActivateSession = sessionId !== activeSessionId;
+      // A saved (expired) chat is not live in the backend, so activating it
+      // would only 404; its banner offers Catch me up instead.
+      const isExpired = useSessionStore
+        .getState()
+        .sessions.some((s) => s.id === sessionId && s.expired);
+      const shouldActivateSession = sessionId !== activeSessionId && !isExpired;
       switchSession(sessionId);
       if (shouldActivateSession) {
         void (async () => {

@@ -38,6 +38,14 @@ export function loadBackendMessages(sessionId: string): unknown[] {
   return map[sessionId] ?? [];
 }
 
+/** Ids of the sessions with at least one cached message, in one read. */
+export function cachedBackendSessionIds(): Set<string> {
+  const map = readAll();
+  return new Set(
+    Object.keys(map).filter((id) => Array.isArray(map[id]) && map[id].length > 0),
+  );
+}
+
 export function saveBackendMessages(sessionId: string, messages: unknown[]): void {
   const map = readAll();
   // Re-insert so key order stays least recently written first.
