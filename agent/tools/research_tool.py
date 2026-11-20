@@ -17,6 +17,7 @@ from litellm import Message, acompletion
 from agent.core import telemetry
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
+from agent.core.llm_response import reply_message
 from agent.core.model_ids import (
     is_direct_anthropic_model_id,
     strip_huggingface_model_prefix,
@@ -492,7 +493,7 @@ async def research_handler(
                         )
                 except Exception as _telem_err:
                     logger.debug("research telemetry failed: %s", _telem_err)
-                content = response.choices[0].message.content or ""
+                content = reply_message(response).content or ""
                 return (
                     content or "Research context exhausted — no summary produced.",
                     bool(content),
@@ -547,8 +548,8 @@ async def research_handler(
             _total_tokens = response.usage.total_tokens
             await _log(f"tokens:{_total_tokens}")
 
-        choice = response.choices[0]
-        msg = choice.message
+        # The direct OpenAI bridge can split one reply across choices.
+        msg = reply_message(response)
 
         # If no tool calls, we have our final answer
         if not msg.tool_calls:
@@ -640,7 +641,7 @@ async def research_handler(
                 return "Research paused because the YOLO cap was reached.", False
         except Exception as _telem_err:
             logger.debug("research telemetry failed: %s", _telem_err)
-        content = response.choices[0].message.content or ""
+        content = reply_message(response).content or ""
         if content:
             return content, True
     except Exception as e:

@@ -13,6 +13,10 @@ Three outcomes, classified from the 400 error text:
   cache ``None`` so we stop sending thinking params
 * ``"effort ... invalid"`` / synonyms → cascade walks down and retries
 
+A direct OpenAI reply cut off by the probe's tiny output cap also counts as
+success: OpenAI answered 200 "incomplete", and LiteLLM's Responses API bridge
+turns that into an error when no text was written yet.
+
 Transient errors (5xx, timeout, connection reset) bubble out as
 ``ProbeInconclusive`` so the caller can complete the switch with a
 warning instead of blocking on a flaky provider.
@@ -28,8 +32,13 @@ from typing import Any
 
 from litellm import acompletion
 
-from agent.core.llm_params import UnsupportedEffortError, _resolve_llm_params
+from agent.core.llm_params import (
+    UnsupportedEffortError,
+    _resolve_llm_params,
+    with_output_token_cap,
+)
 from agent.core.prompt_caching import router_session_id_for, with_prompt_cache_params
+from agent.core.provider_errors import is_output_cap_error
 from agent.core.yolo_budget import maybe_pause_yolo_after_spend
 
 logger = logging.getLogger(__name__)
@@ -113,6 +122,10 @@ def _is_invalid_effort(e: Exception) -> bool:
             # LiteLLM's own pre-flight validation phrasing.
             "only supported by",
             "is only supported",
+            # OpenAI: "Unsupported value: 'reasoning.effort' does not support
+            # 'max' with this model."
+            "unsupported value",
+            "does not support",
         )
     )
 
@@ -147,6 +160,20 @@ def _is_transient(e: Exception) -> bool:
             "eof",
             "broken pipe",
         )
+    )
+
+
+def _accepted_outcome(
+    effort: str, preference: str, attempts: int, elapsed_ms: int
+) -> ProbeOutcome:
+    note = (
+        None if effort == preference else f"{preference} not supported, using {effort}"
+    )
+    return ProbeOutcome(
+        effective_effort=effort,
+        attempts=attempts,
+        elapsed_ms=elapsed_ms,
+        note=note,
     )
 
 
@@ -203,7 +230,7 @@ async def probe_effort(
 
         attempts += 1
         probe_messages = [{"role": "user", "content": "ping"}]
-        params = {**params, "max_tokens": _PROBE_MAX_TOKENS}
+        params = with_output_token_cap(params, _PROBE_MAX_TOKENS)
         try:
             _t0 = time.monotonic()
             response = await asyncio.wait_for(
@@ -247,6 +274,14 @@ async def probe_effort(
                     logger.debug("effort_probe telemetry failed: %s", _telem_err)
         except Exception as e:
             last_error = e
+            if is_output_cap_error(e):
+                # Accepted; the reply just outgrew the probe's output cap.
+                return _accepted_outcome(
+                    effort,
+                    preference,
+                    attempts,
+                    int((loop.time() - start) * 1000),
+                )
             if _is_thinking_unsupported(e):
                 elapsed = int((loop.time() - start) * 1000)
                 return ProbeOutcome(
@@ -266,15 +301,11 @@ async def probe_effort(
             # let the caller classify & surface.
             raise
         else:
-            elapsed = int((loop.time() - start) * 1000)
-            note = None
-            if effort != preference:
-                note = f"{preference} not supported, using {effort}"
-            return ProbeOutcome(
-                effective_effort=effort,
-                attempts=attempts,
-                elapsed_ms=elapsed,
-                note=note,
+            return _accepted_outcome(
+                effort,
+                preference,
+                attempts,
+                int((loop.time() - start) * 1000),
             )
 
     # Cascade exhausted without a success. This only happens when every

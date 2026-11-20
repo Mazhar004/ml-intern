@@ -28,10 +28,15 @@ from agent.core.llm_params import (
 )
 from agent.core.model_ids import (
     ANTHROPIC_API_BASE_URL,
+    CLAUDE_FABLE_52_MODEL_ID,
+    CLAUDE_HAIKU_55_MODEL_ID,
     CLAUDE_OPUS_48_MODEL_ID,
     CLAUDE_OPUS_55_MODEL_ID,
     CLAUDE_SONNET_55_MODEL_ID,
+    DIRECT_ANTHROPIC_MODEL_IDS,
     HF_ROUTER_BASE_URL,
+    direct_provider_for,
+    is_direct_anthropic_model_id,
 )
 from agent.core.prompt_caching import with_prompt_cache_params, with_prompt_caching
 
@@ -49,7 +54,12 @@ FORBIDDEN_DIRECT_KEYS = (
     "top_p",
     "top_k",
 )
-DIRECT_IDS = (CLAUDE_OPUS_55_MODEL_ID, CLAUDE_SONNET_55_MODEL_ID)
+DIRECT_IDS = (
+    CLAUDE_OPUS_55_MODEL_ID,
+    CLAUDE_FABLE_52_MODEL_ID,
+    CLAUDE_SONNET_55_MODEL_ID,
+    CLAUDE_HAIKU_55_MODEL_ID,
+)
 
 
 @pytest.fixture
@@ -64,15 +74,50 @@ def _fail_hf_token_lookup(*_args, **_kwargs):
     raise AssertionError("direct Anthropic must not resolve an HF token")
 
 
-# ── Model registration ────────────────────────────────────────────────────
+# ── Model ids ─────────────────────────────────────────────────────────────
+
+
+def test_direct_anthropic_allowlist_holds_exactly_the_four_ids():
+    assert DIRECT_ANTHROPIC_MODEL_IDS == frozenset(DIRECT_IDS)
+    assert CLAUDE_FABLE_52_MODEL_ID == "anthropic/claude-fable-5-2"
+    assert CLAUDE_HAIKU_55_MODEL_ID == "anthropic/claude-haiku-5-5"
 
 
 @pytest.mark.parametrize("model_id", DIRECT_IDS)
-def test_registered_direct_models_expose_1m_context_and_128k_output(model_id):
+def test_direct_anthropic_ids_name_the_anthropic_provider(model_id):
+    assert is_direct_anthropic_model_id(model_id) is True
+    assert direct_provider_for(model_id) == "anthropic"
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["anthropic/claude-fable-5-2:fal-ai", "huggingface/anthropic/claude-haiku-5-5"],
+)
+def test_suffixed_or_prefixed_claude_ids_are_not_direct(model_id):
+    assert is_direct_anthropic_model_id(model_id) is False
+
+
+# ── Model registration ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("model_id", "max_input_tokens"),
+    [
+        (CLAUDE_OPUS_55_MODEL_ID, 1_000_000),
+        (CLAUDE_FABLE_52_MODEL_ID, 1_000_000),
+        (CLAUDE_SONNET_55_MODEL_ID, 1_000_000),
+        # Haiku 5.5's real window is 1M, but prompts over 100K bill at a higher
+        # tier LiteLLM can't express, so compaction keeps it under 100K.
+        (CLAUDE_HAIKU_55_MODEL_ID, 100_000),
+    ],
+)
+def test_registered_direct_models_expose_context_and_128k_output(
+    model_id, max_input_tokens
+):
     info = litellm.get_model_info(model_id)
 
     assert info["litellm_provider"] == "anthropic"
-    assert info["max_input_tokens"] == 1_000_000
+    assert info["max_input_tokens"] == max_input_tokens
     assert info["max_output_tokens"] == 128_000
     assert info["supports_function_calling"] is True
     assert info["supports_prompt_caching"] is True
@@ -93,9 +138,14 @@ def test_registered_direct_models_never_claim_reasoning_support(model_id):
     [
         # 100 in, 50 out, 1000 cache-read, 200 cache-write (5-minute TTL)
         (CLAUDE_OPUS_55_MODEL_ID, 100 * 4e-6 + 50 * 2e-5 + 1000 * 2e-7 + 200 * 5e-6),
+        (CLAUDE_FABLE_52_MODEL_ID, 100 * 8e-6 + 50 * 4e-5 + 1000 * 2e-7 + 200 * 1e-5),
         (
             CLAUDE_SONNET_55_MODEL_ID,
-            100 * 2e-6 + 50 * 1e-5 + 1000 * 2e-7 + 200 * 2.5e-6,
+            100 * 2e-6 + 50 * 1e-5 + 1000 * 1e-7 + 200 * 2.5e-6,
+        ),
+        (
+            CLAUDE_HAIKU_55_MODEL_ID,
+            100 * 1e-7 + 50 * 5e-7 + 1000 * 1e-8 + 200 * 1.25e-7,
         ),
     ],
 )
@@ -120,11 +170,12 @@ def test_registered_direct_models_price_cache_reads_and_writes(model_id, expecte
 
 
 def test_registration_overrides_a_stale_remote_map_entry(monkeypatch):
-    # The remote LiteLLM map lists Sonnet 5.5 cache reads at $0.10/M and
-    # supports_reasoning=True; registration must win regardless.
+    # A stale map entry (the old $0.20/M Sonnet 5.5 cache-read price, and
+    # supports_reasoning=True) must lose to the registration: Sonnet 5.5
+    # cache reads cost $0.10/M.
     stale = {
         **litellm.model_cost["claude-sonnet-5-5"],
-        "cache_read_input_token_cost": 1e-7,
+        "cache_read_input_token_cost": 2e-7,
         "supports_reasoning": True,
     }
     monkeypatch.setitem(litellm.model_cost, "claude-sonnet-5-5", stale)
@@ -132,14 +183,16 @@ def test_registration_overrides_a_stale_remote_map_entry(monkeypatch):
     register_direct_anthropic_models()
 
     info = litellm.get_model_info(CLAUDE_SONNET_55_MODEL_ID)
-    assert info["cache_read_input_token_cost"] == pytest.approx(2e-7)
+    assert info["cache_read_input_token_cost"] == pytest.approx(1e-7)
     assert info["supports_reasoning"] is False
 
 
 def test_registration_data_is_keyed_by_bare_litellm_model_names():
     assert set(DIRECT_ANTHROPIC_LITELLM_MODELS) == {
         "claude-opus-5-5",
+        "claude-fable-5-2",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
     }
 
 

@@ -493,3 +493,59 @@ def test_direct_anthropic_ignores_router_claude_shape():
     cached_messages, _ = with_prompt_caching(messages, None, _anthropic_fal_params())
 
     assert cached_messages[1] is messages[1]
+
+
+# ── Direct OpenAI API (api.openai.com) ────────────────────────────────────
+
+
+def _direct_openai_params(model: str = "openai/gpt-5.5") -> dict:
+    return {
+        "model": model,
+        "api_base": "https://api.openai.com/v1",
+        "api_key": "sk-openai-test",
+        "max_completion_tokens": 32000,
+        "extra_body": {"store": False, "reasoning_effort": "high"},
+    }
+
+
+def test_direct_openai_prompt_cache_params_are_returned_unchanged():
+    llm_params = _direct_openai_params()
+
+    cached_params = with_prompt_cache_params(llm_params, session_id=BILLING_SESSION_ID)
+
+    assert cached_params is llm_params
+    assert cached_params["extra_body"] == {"store": False, "reasoning_effort": "high"}
+    assert "extra_headers" not in cached_params
+
+
+def test_direct_openai_prompt_caching_leaves_messages_and_tools_alone():
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "stable reference"},
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "user", "content": "current question"},
+    ]
+    tools = [{"type": "function", "function": {"name": "read"}}]
+
+    for model in ("openai/gpt-5.5", "openai/gpt-6.2-sol"):
+        cached_messages, cached_tools = with_prompt_caching(
+            messages, tools, _direct_openai_params(model)
+        )
+
+        assert cached_messages is messages
+        assert cached_tools is tools
+        assert _cache_markers(cached_messages, cached_tools) == 0
+
+
+def test_router_gpt55_keeps_its_cache_hints_beside_direct_gpt55():
+    cached_params = with_prompt_cache_params(
+        _gpt55_fal_params(), session_id=BILLING_SESSION_ID
+    )
+
+    assert cached_params["extra_body"] == {
+        "prompt_cache_key": BILLING_SESSION_ID,
+        "prompt_cache_retention": "24h",
+    }
+    assert cached_params["extra_headers"] == {
+        HF_ROUTER_SESSION_ID_HEADER: BILLING_SESSION_ID
+    }

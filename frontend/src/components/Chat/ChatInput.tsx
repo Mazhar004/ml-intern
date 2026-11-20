@@ -24,16 +24,25 @@ import JobsUpgradeDialog from '@/components/JobsUpgradeDialog';
 import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import {
+  CLAUDE_FABLE_52_DIRECT_PATH,
+  CLAUDE_HAIKU_55_DIRECT_PATH,
   CLAUDE_OPUS_48_MODEL_PATH,
   CLAUDE_OPUS_55_DIRECT_PATH,
   CLAUDE_SONNET_55_DIRECT_PATH,
+  DEEPSEEK_V4_FLASH_DIRECT_PATH,
   DEEPSEEK_V4_PRO_DIRECT_PATH,
   GLM_52_MODEL_PATH,
+  GPT_55_DIRECT_PATH,
   GPT_55_MODEL_PATH,
+  GPT_61_TERRA_DIRECT_PATH,
+  GPT_62_ASTRA_DIRECT_PATH,
+  GPT_62_SOL_DIRECT_PATH,
+  GPT_6_LUNA_DIRECT_PATH,
   KIMI_K27_CODE_MODEL_PATH,
   MINIMAX_M3_MODEL_PATH,
+  billingLabelForPath,
+  billingRouteForPath,
   isClaudePath,
-  isDirectAnthropicPath,
 } from '@/utils/model';
 
 // Model configuration
@@ -45,68 +54,49 @@ interface ModelOption {
   recommended?: boolean;
 }
 
+// Direct DeepSeek ids carry LiteLLM's ``deepseek/`` prefix, but DeepSeek's HF
+// org (and logo) is deepseek-ai; ``deepseek`` only has a placeholder avatar.
+const AVATAR_ORG_ALIASES: Partial<Record<string, string>> = { deepseek: 'deepseek-ai' };
+
 const getHfAvatarUrl = (modelId: string) => {
   const org = modelId.split('/')[0];
-  return `https://huggingface.co/api/avatars/${org}`;
+  return `https://huggingface.co/api/avatars/${AVATAR_ORG_ALIASES[org] ?? org}`;
 };
 
+const withAvatar = (model: Omit<ModelOption, 'avatarUrl'>): ModelOption => ({
+  ...model,
+  avatarUrl: getHfAvatarUrl(model.modelPath),
+});
+
+// Every picker model, in the order and with the labels of AVAILABLE_MODELS in
+// agent/core/web_models.py. The picker shows this list only until
+// /api/config/model answers with the models whose keys are set; after that it
+// still names a session model the backend hides. Ids only need to be unique.
 const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
-  {
-    id: 'claude-opus-4-8',
-    name: 'Claude Opus 4.8',
-    modelPath: CLAUDE_OPUS_48_MODEL_PATH,
-    avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_48_MODEL_PATH),
-  },
-  {
-    // Direct Anthropic API (the user's own ANTHROPIC_API_KEY via LiteLLM's
-    // native ``anthropic/`` provider), not the HF Router Claude above. The
-    // web default; the backend falls back to GLM 5.2 when the key is unset.
-    id: 'claude-opus-5-5',
-    name: 'Claude Opus 5.5',
-    modelPath: CLAUDE_OPUS_55_DIRECT_PATH,
-    avatarUrl: getHfAvatarUrl(CLAUDE_OPUS_55_DIRECT_PATH),
-    recommended: true,
-  },
-  {
-    id: 'claude-sonnet-5-5',
-    name: 'Claude Sonnet 5.5',
-    modelPath: CLAUDE_SONNET_55_DIRECT_PATH,
-    avatarUrl: getHfAvatarUrl(CLAUDE_SONNET_55_DIRECT_PATH),
-  },
-  {
-    id: 'gpt-5.5',
-    name: 'GPT-5.5',
-    modelPath: GPT_55_MODEL_PATH,
-    avatarUrl: getHfAvatarUrl(GPT_55_MODEL_PATH),
-  },
-  {
-    id: 'kimi-k2.7-code',
-    name: 'Kimi K2.7 Code',
-    modelPath: KIMI_K27_CODE_MODEL_PATH,
-    avatarUrl: getHfAvatarUrl(KIMI_K27_CODE_MODEL_PATH),
-  },
-  {
-    id: 'minimax-m3',
-    name: 'MiniMax M3',
-    modelPath: MINIMAX_M3_MODEL_PATH,
-    avatarUrl: getHfAvatarUrl(MINIMAX_M3_MODEL_PATH),
-  },
-  {
-    id: 'glm-5.2',
-    name: 'GLM 5.2',
-    modelPath: GLM_52_MODEL_PATH,
-    avatarUrl: getHfAvatarUrl(GLM_52_MODEL_PATH),
-  },
-  {
-    // Direct DeepSeek provider (uses the user's own DEEPSEEK_API_KEY via the
-    // ``deepseek/`` LiteLLM route in agent/core/llm_params.py), not the HF
-    // Router id. Selectable from the picker.
-    id: 'deepseek-v4-pro',
-    name: 'DeepSeek V4 Pro',
-    modelPath: DEEPSEEK_V4_PRO_DIRECT_PATH,
-    avatarUrl: getHfAvatarUrl('deepseek-ai/DeepSeek-V4-Pro'),
-  },
-];
+  // HF Router Claude (HF token, HF credits).
+  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', modelPath: CLAUDE_OPUS_48_MODEL_PATH },
+  // Direct Anthropic API (ANTHROPIC_API_KEY). Opus 5.5 is the web default; the
+  // backend falls back to GLM 5.2 when the key is unset.
+  { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', modelPath: CLAUDE_OPUS_55_DIRECT_PATH, recommended: true },
+  { id: 'claude-fable-5-2', name: 'Claude Fable 5.2', modelPath: CLAUDE_FABLE_52_DIRECT_PATH },
+  { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', modelPath: CLAUDE_SONNET_55_DIRECT_PATH },
+  { id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', modelPath: CLAUDE_HAIKU_55_DIRECT_PATH },
+  // GPT-5.5 on the HF Router, then the direct OpenAI API (OPENAI_API_KEY).
+  { id: 'gpt-5.5', name: 'GPT-5.5', modelPath: GPT_55_MODEL_PATH },
+  { id: 'gpt-5.5-openai', name: 'GPT-5.5 (OpenAI key)', modelPath: GPT_55_DIRECT_PATH },
+  { id: 'gpt-6.2-astra', name: 'GPT-6.2 Astra', modelPath: GPT_62_ASTRA_DIRECT_PATH },
+  { id: 'gpt-6.2-sol', name: 'GPT-6.2 Sol', modelPath: GPT_62_SOL_DIRECT_PATH },
+  { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', modelPath: GPT_61_TERRA_DIRECT_PATH },
+  { id: 'gpt-6-luna', name: 'GPT-6 Luna', modelPath: GPT_6_LUNA_DIRECT_PATH },
+  // HF Router open models.
+  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', modelPath: KIMI_K27_CODE_MODEL_PATH },
+  { id: 'minimax-m3', name: 'MiniMax M3', modelPath: MINIMAX_M3_MODEL_PATH },
+  { id: 'glm-5.2', name: 'GLM 5.2', modelPath: GLM_52_MODEL_PATH },
+  // Direct DeepSeek API (DEEPSEEK_API_KEY via LiteLLM's ``deepseek/`` route in
+  // agent/core/llm_params.py), not the HF Router DeepSeek id.
+  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', modelPath: DEEPSEEK_V4_PRO_DIRECT_PATH },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', modelPath: DEEPSEEK_V4_FLASH_DIRECT_PATH },
+].map(withAvatar);
 
 // Shown until /api/config/model reports the backend's current default.
 const DEFAULT_MODEL_PATH = CLAUDE_OPUS_55_DIRECT_PATH;
@@ -122,26 +112,24 @@ const claudeFamily = (path: string) => (
   normalizeModelPath(path).match(/claude-(opus|sonnet|haiku)/)?.[1] ?? null
 );
 
-// Never cross billing routes, whatever the list order: a direct-Anthropic id
-// only matches the direct entries, and HF Router / legacy ids never do.
-const isSameRoute = (a: string, b: string) => isDirectAnthropicPath(a) === isDirectAnthropicPath(b);
+// Never cross billing routes, whatever the list order: a direct id only
+// matches entries billed to the same provider key, and HF Router / legacy ids
+// only match HF Router entries (route = directProviderForPath(path) ?? 'hf').
+const isSameRoute = (a: string, b: string) => billingRouteForPath(a) === billingRouteForPath(b);
 
 const findModelByPath = (path: string, options: ModelOption[]): ModelOption | undefined => {
-  const normalizedPath = normalizeModelPath(path);
   const candidates = options.filter((m) => isSameRoute(m.modelPath, path));
-  const matched = candidates.find((m) => {
-    const normalizedModelPath = normalizeModelPath(m.modelPath);
-    const normalizedId = normalizeModelPath(m.id);
-    return (
-      m.modelPath === path ||
-      normalizedModelPath === normalizedPath ||
-      normalizedPath.includes(normalizedId)
-    );
-  });
+  const normalizedPath = normalizeModelPath(path);
+  const matched = candidates.find((m) => m.modelPath === path)
+    ?? candidates.find((m) => normalizeModelPath(m.modelPath) === normalizedPath);
   if (matched) return matched;
-  // Direct ids are exact; other Claude ids fall back to an HF Router Claude,
-  // preferring the same family (opus/sonnet/haiku).
-  if (isDirectAnthropicPath(path) || !isClaudePath(path)) return undefined;
+  // Direct ids match exactly. Only HF Router ids match loosely: by option id,
+  // then any other Claude id falls back to an HF Router Claude, preferring the
+  // same family (opus/sonnet/haiku).
+  if (billingRouteForPath(path) !== 'hf') return undefined;
+  const byId = candidates.find((m) => normalizedPath.includes(normalizeModelPath(m.id)));
+  if (byId) return byId;
+  if (!isClaudePath(path)) return undefined;
   const routerClaude = candidates.filter((m) => isClaudePath(m.modelPath));
   const family = claudeFamily(path);
   return routerClaude.find((m) => claudeFamily(m.modelPath) === family) ?? routerClaude[0];
@@ -168,10 +156,12 @@ const modelOptionFromApi = (model: {
   };
 };
 
-// A session model missing from the list (e.g. a direct id the backend did not
-// list) is shown by its raw id instead of the recommended model.
+// A session model missing from the list (e.g. a direct model whose key is
+// unset, so the backend hides it) keeps its known label and billing caption;
+// an id unknown here too is shown raw instead of as the recommended model.
 const resolveSelectedModel = (modelPath: string, options: ModelOption[]): ModelOption => (
   findModelByPath(modelPath, options)
+  || findModelByPath(modelPath, DEFAULT_MODEL_OPTIONS)
   || modelOptionFromApi({ id: modelPath })
   || options.find((m) => m.recommended)
   || options[0]
@@ -707,6 +697,9 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
           />
           <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
             {selectedModel.name}
+            <Box component="span" sx={{ color: 'var(--muted-text)', fontWeight: 500 }}>
+              {` · ${billingLabelForPath(selectedModel.modelPath)}`}
+            </Box>
           </Typography>
           <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
         </Box>
@@ -741,7 +734,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
               onClick={() => handleSelectModel(model)}
               selected={selectedModel.modelPath === model.modelPath}
               sx={{
-                py: 1.5,
+                py: 1,
                 '&.Mui-selected': {
                   bgcolor: 'rgba(255,255,255,0.05)',
                 }
@@ -773,6 +766,10 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
                     )}
                   </Box>
                 }
+                secondary={billingLabelForPath(model.modelPath)}
+                slotProps={{
+                  secondary: { sx: { fontSize: '11px', color: 'var(--muted-text)' } },
+                }}
               />
             </MenuItem>
           ))}

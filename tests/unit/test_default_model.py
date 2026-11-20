@@ -25,11 +25,18 @@ from agent.core import web_models  # noqa: E402
 from agent.config import substitute_env_vars  # noqa: E402
 from agent.core.model_ids import (  # noqa: E402
     ANTHROPIC_API_BASE_URL,
+    CLAUDE_FABLE_52_MODEL_ID,
+    CLAUDE_HAIKU_55_MODEL_ID,
     CLAUDE_OPUS_48_MODEL_ID,
     CLAUDE_OPUS_55_MODEL_ID,
     CLAUDE_SONNET_55_MODEL_ID,
     GLM_52_MODEL_ID,
+    GPT_55_DIRECT_MODEL_ID,
     GPT_55_MODEL_ID,
+    GPT_61_TERRA_MODEL_ID,
+    GPT_62_ASTRA_MODEL_ID,
+    GPT_62_SOL_MODEL_ID,
+    GPT_6_LUNA_MODEL_ID,
     HF_ROUTER_BASE_URL,
     KIMI_K27_CODE_MODEL_ID,
     MINIMAX_M3_MODEL_ID,
@@ -241,20 +248,28 @@ def test_missing_key_env_names_only_the_variable(no_anthropic_key):
 # ── Picker ──────────────────────────────────────────────────────────────
 
 
-def test_picker_order_is_unchanged():
+def test_picker_lists_all_16_models_in_display_order():
     ids = [model["id"] for model in agent.AVAILABLE_MODELS]
 
     assert ids == [
         CLAUDE_OPUS_48_MODEL_ID,
         CLAUDE_OPUS_55_MODEL_ID,
+        CLAUDE_FABLE_52_MODEL_ID,
         CLAUDE_SONNET_55_MODEL_ID,
+        CLAUDE_HAIKU_55_MODEL_ID,
         GPT_55_MODEL_ID,
+        GPT_55_DIRECT_MODEL_ID,
+        GPT_62_ASTRA_MODEL_ID,
+        GPT_62_SOL_MODEL_ID,
+        GPT_61_TERRA_MODEL_ID,
+        GPT_6_LUNA_MODEL_ID,
         KIMI_K27_CODE_MODEL_ID,
         MINIMAX_M3_MODEL_ID,
         GLM_52_MODEL_ID,
         DEEPSEEK_PRO_ID,
         DEEPSEEK_FLASH_ID,
     ]
+    assert web_models.PICKER_MODEL_IDS == frozenset(ids)
 
 
 def test_picker_recommends_claude_opus_55_and_keeps_glm_entry():
@@ -289,7 +304,8 @@ async def test_config_model_current_is_claude_with_key(monkeypatch, anthropic_ke
     response = await agent.get_model()
 
     assert response["current"] == CLAUDE_OPUS_55_MODEL_ID
-    assert response["available"] is agent.AVAILABLE_MODELS
+    assert response["available"] == web_models.visible_picker_models()
+    assert response["available"] is not agent.AVAILABLE_MODELS
 
 
 async def test_config_model_current_falls_back_to_glm_without_key(

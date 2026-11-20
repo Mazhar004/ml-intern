@@ -32,8 +32,8 @@ import {
   creditCtaForModel,
   inferenceCreditCta,
   isInferenceCreditError,
+  usesProviderNotices,
 } from '@/utils/inferenceBilling';
-import { isDirectAnthropicPath } from '@/utils/model';
 import { loadBackendMessages } from '@/lib/backend-message-store';
 import { loadMessages } from '@/lib/chat-message-store';
 
@@ -209,19 +209,20 @@ export default function AppLayout() {
       ? 'LLM Provider Unreachable'
       : 'LLM Error'
     : '';
-  // The health probe targets the web default, which is Claude on the direct
-  // Anthropic API when ANTHROPIC_API_KEY is set: its credit / key problems get
-  // the Anthropic notice, never the HF PRO upsell. HF Router models keep the
-  // HF credits CTA exactly as before.
+  // The health probe targets the web default: Claude on the direct Anthropic
+  // API when ANTHROPIC_API_KEY is set, or a direct OpenAI model when
+  // ML_INTERN_DEFAULT_MODEL_ID names one. Their credit / quota / key problems
+  // get that provider's notice, never the HF PRO upsell. HF Router models
+  // (and direct DeepSeek) keep the HF credits CTA exactly as before.
   const llmCreditCta = !llmHealthError
     ? null
-    : isDirectAnthropicPath(llmHealthError.model)
+    : usesProviderNotices(llmHealthError.model)
       ? creditCtaForModel(llmHealthError.model, llmHealthError.error, user?.plan)
       : isInferenceCreditError(llmHealthError.error, llmHealthError.errorType)
         ? inferenceCreditCta(user?.plan)
         : null;
   const llmHfCta = llmCreditCta?.kind === 'hf' ? llmCreditCta : null;
-  const llmAnthropicNotice = llmCreditCta?.kind === 'anthropic' ? llmCreditCta : null;
+  const llmProviderNotice = llmCreditCta && llmCreditCta.kind !== 'hf' ? llmCreditCta : null;
 
   const trackHealthProClick = () => {
     if (user?.plan === 'pro' || !activeSessionId) return;
@@ -507,16 +508,16 @@ export default function AppLayout() {
           sx={{ fontSize: '0.8rem', maxWidth: 480 }}
         >
           <AlertTitle sx={{ fontWeight: 700, fontSize: '0.85rem' }}>
-            {llmAnthropicNotice ? llmAnthropicNotice.title : llmErrorTitle}
+            {llmProviderNotice ? llmProviderNotice.title : llmErrorTitle}
           </AlertTitle>
           {llmHealthError && (
             <Typography variant="body2" sx={{ fontSize: '0.78rem', opacity: 0.9 }}>
               {llmHealthError.model} — {llmHealthError.error.slice(0, 150)}
             </Typography>
           )}
-          {llmAnthropicNotice && (
+          {llmProviderNotice && (
             <Typography variant="body2" sx={{ fontSize: '0.78rem', mt: 0.75 }}>
-              {llmAnthropicNotice.message}
+              {llmProviderNotice.message}
             </Typography>
           )}
           {llmHfCta && (

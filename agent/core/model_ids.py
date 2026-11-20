@@ -2,20 +2,49 @@
 
 HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
 ANTHROPIC_API_BASE_URL = "https://api.anthropic.com"
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 # Direct Anthropic API ids: LiteLLM's native ``anthropic/`` provider, billed to
 # ANTHROPIC_API_KEY. The HF Router Claude id below also starts with
 # ``anthropic/`` (it carries a ``:fal-ai`` suffix), so always match these by
 # exact membership via ``is_direct_anthropic_model_id`` — never by prefix.
 CLAUDE_OPUS_55_MODEL_ID = "anthropic/claude-opus-5-5"
+CLAUDE_FABLE_52_MODEL_ID = "anthropic/claude-fable-5-2"
 CLAUDE_SONNET_55_MODEL_ID = "anthropic/claude-sonnet-5-5"
+CLAUDE_HAIKU_55_MODEL_ID = "anthropic/claude-haiku-5-5"
 DIRECT_ANTHROPIC_MODEL_IDS = frozenset(
-    {CLAUDE_OPUS_55_MODEL_ID, CLAUDE_SONNET_55_MODEL_ID}
+    {
+        CLAUDE_OPUS_55_MODEL_ID,
+        CLAUDE_FABLE_52_MODEL_ID,
+        CLAUDE_SONNET_55_MODEL_ID,
+        CLAUDE_HAIKU_55_MODEL_ID,
+    }
+)
+
+# Direct OpenAI API ids: LiteLLM's ``openai/`` provider at api.openai.com,
+# billed to OPENAI_API_KEY. HF Router ids start with ``openai/`` too
+# (``openai/gpt-5.5:fal-ai``, ``openai/gpt-oss-120b:cerebras``), so always
+# match these by exact membership via ``is_direct_openai_model_id`` — never by
+# prefix.
+GPT_55_DIRECT_MODEL_ID = "openai/gpt-5.5"
+GPT_62_ASTRA_MODEL_ID = "openai/gpt-6.2-astra"
+GPT_62_SOL_MODEL_ID = "openai/gpt-6.2-sol"
+GPT_61_TERRA_MODEL_ID = "openai/gpt-6.1-terra"
+GPT_6_LUNA_MODEL_ID = "openai/gpt-6-luna"
+DIRECT_OPENAI_MODEL_IDS = frozenset(
+    {
+        GPT_55_DIRECT_MODEL_ID,
+        GPT_62_ASTRA_MODEL_ID,
+        GPT_62_SOL_MODEL_ID,
+        GPT_61_TERRA_MODEL_ID,
+        GPT_6_LUNA_MODEL_ID,
+    }
 )
 
 # Env var holding the API key for each direct (non-HF-Router) provider.
 DIRECT_PROVIDER_API_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
 }
 
@@ -59,6 +88,15 @@ def is_direct_anthropic_model_id(model_id: str | None) -> bool:
     return bool(model_id) and model_id in DIRECT_ANTHROPIC_MODEL_IDS
 
 
+def is_direct_openai_model_id(model_id: str | None) -> bool:
+    """True only for ids routed to api.openai.com with OPENAI_API_KEY.
+
+    Matches the raw id: ``openai/gpt-5.5:fal-ai`` (HF Router GPT-5.5),
+    ``huggingface/openai/gpt-5.5`` and any other ``openai/`` id never match.
+    """
+    return bool(model_id) and model_id in DIRECT_OPENAI_MODEL_IDS
+
+
 def direct_provider_for(model_id: str | None) -> str | None:
     """Return the direct provider name for a model id, or None for HF Router.
 
@@ -66,6 +104,8 @@ def direct_provider_for(model_id: str | None) -> str | None:
     """
     if is_direct_anthropic_model_id(model_id):
         return "anthropic"
+    if is_direct_openai_model_id(model_id):
+        return "openai"
     if model_id and model_id.startswith("deepseek/"):
         return "deepseek"
     return None

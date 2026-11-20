@@ -33,6 +33,7 @@ from agent.core.model_ids import (
     GPT_55_MODEL_ID,
     KIMI_K27_CODE_MODEL_ID,
     MINIMAX_M3_MODEL_ID,
+    direct_provider_for,
     strip_huggingface_model_prefix,
 )
 
@@ -88,11 +89,12 @@ def _print_hf_routing_info(model_id: str, console) -> bool:
     proceed with the switch, ``False`` to indicate a hard problem the user
     should notice before we fire the effort probe.
 
-    Local ids return ``True`` without printing anything. Router ids are checked
-    against the router catalog when possible; the probe below covers provider
-    availability for uncataloged ids.
+    Local and direct-provider ids (Anthropic, OpenAI, DeepSeek APIs) return
+    ``True`` without printing anything: they aren't served by the HF router.
+    Router ids are checked against the router catalog when possible; the probe
+    below covers provider availability for uncataloged ids.
     """
-    if is_local_model_id(model_id):
+    if is_local_model_id(model_id) or direct_provider_for(model_id) is not None:
         return True
 
     from agent.core import hf_router_catalog as cat

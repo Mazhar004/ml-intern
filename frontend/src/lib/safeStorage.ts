@@ -224,6 +224,11 @@ function writeOrReclaim(
   return false;
 }
 
+/** localStorage.getItem that never throws: blocked storage reads as missing. */
+export function safeGetItem(key: string): string | null {
+  return readItem(key);
+}
+
 /**
  * localStorage.setItem that never throws. On a quota error it evicts cached
  * messages of sessions other than the active one and retries once.

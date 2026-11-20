@@ -16,11 +16,20 @@ previous request, so long tool loops keep hitting the cache. Anthropic allows
 at most 4 breakpoints. No HF Router hints (``extra_body``, session header)
 are sent there: LiteLLM's native Anthropic provider would send ``extra_body``
 as a literal body key, and the HF session id doesn't belong at Anthropic.
+
+The direct OpenAI API route (``is_direct_openai_model_id``) is left alone:
+OpenAI caches eligible prefixes automatically, ``cache_control`` markers mean
+nothing there, and the HF session id and router cache hints don't belong at
+OpenAI.
 """
 
 from typing import Any
 
-from agent.core.model_ids import HF_ROUTER_BASE_URL, is_direct_anthropic_model_id
+from agent.core.model_ids import (
+    HF_ROUTER_BASE_URL,
+    is_direct_anthropic_model_id,
+    is_direct_openai_model_id,
+)
 
 _CACHE_CONTROL = {"type": "ephemeral"}
 _CACHEABLE_ROLES = {"system", "user"}
@@ -57,6 +66,10 @@ def _router_model(llm_params: dict[str, Any]) -> str:
 
 def _is_direct_anthropic_request(llm_params: dict[str, Any]) -> bool:
     return is_direct_anthropic_model_id(str(llm_params.get("model") or ""))
+
+
+def _is_direct_openai_request(llm_params: dict[str, Any]) -> bool:
+    return is_direct_openai_model_id(str(llm_params.get("model") or ""))
 
 
 def _uses_explicit_cache_control(llm_params: dict[str, Any]) -> bool:
@@ -105,6 +118,9 @@ def with_prompt_cache_params(
     """Return LiteLLM params with provider-native prompt-cache body hints."""
     if _is_direct_anthropic_request(llm_params):
         # Block-level breakpoints only (``with_prompt_caching``).
+        return llm_params
+    if _is_direct_openai_request(llm_params):
+        # OpenAI caches prefixes automatically; no router hints or header.
         return llm_params
 
     updates: dict[str, Any] = {}
@@ -312,9 +328,13 @@ def with_prompt_caching(
     Direct Anthropic API models get up to 4 breakpoints instead (see
     ``_direct_anthropic_cache_targets``). Marked messages are always copies;
     assistant turns (and their signed thinking blocks) are never touched.
+    Direct OpenAI API models get no markers at all.
     """
     if _is_direct_anthropic_request(llm_params):
         return _with_direct_anthropic_caching(messages, tools)
+
+    if _is_direct_openai_request(llm_params):
+        return messages, tools
 
     if not _uses_explicit_cache_control(llm_params):
         return messages, tools

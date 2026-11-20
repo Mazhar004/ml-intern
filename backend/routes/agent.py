@@ -43,6 +43,7 @@ from agent.core.web_models import (
     PICKER_MODEL_IDS,
     missing_direct_provider_key_env,
     resolve_default_model_id,
+    visible_picker_models,
 )
 from models import (
     ApprovalRequest,
@@ -79,13 +80,19 @@ from session_manager import (
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token
 from agent.core.local_models import local_model_provider
-from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
+from agent.core.llm_params import (
+    MissingProviderKeyError,
+    _resolve_llm_params,
+    with_output_token_cap,
+)
 from agent.core.model_ids import (
     direct_provider_for,
     is_direct_anthropic_model_id,
+    is_direct_openai_model_id,
     strip_huggingface_model_prefix,
 )
 from agent.core.prompt_caching import with_prompt_cache_params
+from agent.core.provider_errors import is_output_cap_error, openai_error_kind
 from usage import build_usage_response
 
 logger = logging.getLogger(__name__)
@@ -96,6 +103,8 @@ _background_route_tasks: set[asyncio.Task] = set()
 DATASET_UPLOAD_MULTIPART_SLACK_BYTES = 1024 * 1024
 # LLM health probe: one tiny completion (see _health_probe_kwargs).
 HEALTH_PROBE_MAX_TOKENS = 1
+# The OpenAI Responses API rejects output caps below 16 tokens.
+HEALTH_PROBE_DIRECT_OPENAI_MAX_TOKENS = 64
 HEALTH_PROBE_TIMEOUT_S = 10
 HEALTH_PROBE_ROUTER_EFFORT = "high"
 
@@ -162,7 +171,7 @@ def _user_hf_token(user: dict[str, Any] | None) -> str | None:
 
 def _model_requires_hf_router_token(model_id: str | None) -> bool:
     if direct_provider_for(model_id) is not None:
-        # Direct Anthropic / DeepSeek calls authenticate with their own key.
+        # Direct Anthropic / OpenAI / DeepSeek calls use their own API key.
         return False
     normalized = strip_huggingface_model_prefix(model_id) or model_id or ""
     return local_model_provider(normalized) is None
@@ -290,34 +299,54 @@ async def health_check() -> HealthResponse:
     )
 
 
-def _health_probe_kwargs(model: str, hf_token: str | None) -> dict[str, Any]:
-    """LiteLLM kwargs for the health probe: a 1-token completion.
+def _health_probe_effort(model: str) -> str | None:
+    """No effort for direct Claude or direct GPT, "high" for other models."""
+    if is_direct_anthropic_model_id(model) or is_direct_openai_model_id(model):
+        return None
+    return HEALTH_PROBE_ROUTER_EFFORT
 
-    Direct Claude (Opus/Sonnet 5.5) always thinks and takes effort only as
-    ``output_config``, which a reachability probe doesn't need, so it gets no
-    effort, and the probe's ``max_tokens`` replaces its resolved output
-    budget. Its request then carries no thinking, effort or sampling params.
-    Other models keep their historical probe shape (effort "high").
+
+def _health_probe_output_cap(model: str) -> int:
+    if is_direct_openai_model_id(model):
+        return HEALTH_PROBE_DIRECT_OPENAI_MAX_TOKENS
+    return HEALTH_PROBE_MAX_TOKENS
+
+
+def _health_probe_kwargs(model: str, hf_token: str | None) -> dict[str, Any]:
+    """LiteLLM kwargs for the health probe: one tiny completion.
+
+    Direct Claude (Opus/Fable/Sonnet/Haiku 5.x) always thinks and takes
+    effort only as ``output_config``, which a reachability probe doesn't
+    need, so it gets no effort, and the probe's ``max_tokens`` replaces its
+    resolved output budget. Its request then carries no thinking, effort or
+    sampling params. Direct OpenAI gets no effort either; its cap is
+    ``max_completion_tokens=64`` (the Responses API rejects caps below 16)
+    and it sends no ``max_tokens``. Other models keep their historical
+    probe shape (effort "high", ``max_tokens=1``).
     """
-    effort = None if is_direct_anthropic_model_id(model) else HEALTH_PROBE_ROUTER_EFFORT
-    llm_params = _resolve_llm_params(model, hf_token, reasoning_effort=effort)
+    llm_params = _resolve_llm_params(
+        model, hf_token, reasoning_effort=_health_probe_effort(model)
+    )
     return {
-        **llm_params,
+        **with_output_token_cap(llm_params, _health_probe_output_cap(model)),
         "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": HEALTH_PROBE_MAX_TOKENS,
         "timeout": HEALTH_PROBE_TIMEOUT_S,
     }
 
 
-def _health_error_type(error: Exception) -> str:
+def _health_error_type(error: Exception, model: str | None = None) -> str:
     """Bucket a failed health probe for the UI banner.
 
     Exception types win over text. A bare "invalid" is not an auth signal:
     every Anthropic 400 is an ``invalid_request_error``, including "Your
-    credit balance is too low".
+    credit balance is too low". OpenAI reports an exhausted quota as a 429
+    ``insufficient_quota``: for a direct OpenAI ``model`` that is "credits",
+    while the same 429 from the HF Router stays "rate_limit".
     """
     if isinstance(error, (AuthenticationError, PermissionDeniedError)):
         return "auth"
+    if is_direct_openai_model_id(model) and openai_error_kind(error) == "quota":
+        return "credits"
     if isinstance(error, RateLimitError):
         return "rate_limit"
     err_str = str(error).lower()
@@ -335,6 +364,16 @@ def _health_error_type(error: Exception) -> str:
     return "unknown"
 
 
+def _is_accepted_probe_cutoff(error: Exception, model: str) -> bool:
+    """True when OpenAI accepted a direct OpenAI probe but cut it off.
+
+    OpenAI answers 200 "incomplete" when the probe's 64-token cap runs out
+    during reasoning, and LiteLLM's Responses API bridge raises when no text
+    was written yet. The key and the model worked, so the probe passed.
+    """
+    return is_direct_openai_model_id(model) and is_output_cap_error(error)
+
+
 @router.get("/health/llm", response_model=LLMHealthResponse)
 async def llm_health_check(
     request: Request,
@@ -342,15 +381,18 @@ async def llm_health_check(
 ) -> LLMHealthResponse:
     """Check if the LLM provider is reachable and the API key is valid.
 
-    Makes a minimal 1-token completion call against the web default model
-    (Claude Opus 5.5 on the direct Anthropic API, or GLM 5.2 when its key is
-    missing). Direct-provider models need no HF token. For token-less HF
-    Router requests, returns ``status="skipped"`` instead of making an
-    unauthenticated probe. A direct-provider key that is missing at call time
-    is reported as an ``auth`` error without any network call.
+    Makes a minimal completion call (1 output token, 64 for direct OpenAI)
+    against the web default model (Claude Opus 5.5 on the direct Anthropic
+    API, or GLM 5.2 when its key is missing). Direct-provider models need no
+    HF token. For token-less HF Router requests, returns ``status="skipped"``
+    instead of making an unauthenticated probe. A direct-provider key that
+    is missing at call time is reported as an ``auth`` error without any
+    network call. A direct OpenAI probe cut off by its output cap counts as
+    ``ok``.
     Catches common errors:
     - 401 → invalid API key
-    - 402/insufficient_quota → out of credits
+    - 402/insufficient_quota → out of credits (including a direct OpenAI
+      429 insufficient_quota)
     - 429 → rate limited
     - timeout / network → provider unreachable
     """
@@ -372,7 +414,9 @@ async def llm_health_check(
             error_type="auth",
         )
     except Exception as e:
-        error_type = _health_error_type(e)
+        if _is_accepted_probe_cutoff(e, model):
+            return LLMHealthResponse(status="ok", model=model)
+        error_type = _health_error_type(e, model)
         logger.warning(f"LLM health check failed ({error_type}): {e}")
         return LLMHealthResponse(
             status="error",
@@ -386,12 +430,14 @@ async def llm_health_check(
 async def get_model() -> dict:
     """Get the web default model and the picker list. No auth required.
 
-    ``current`` is what a new session would use right now, so it follows the
-    Anthropic key rather than the config file's ``model_name``.
+    ``available`` leaves out the direct-provider models whose API key isn't
+    set right now. ``current`` is what a new session would use right now, so
+    it follows the keys rather than the config file's ``model_name``, and
+    it is always one of ``available``.
     """
     return {
         "current": resolve_default_model_id(),
-        "available": AVAILABLE_MODELS,
+        "available": visible_picker_models(),
     }
 
 

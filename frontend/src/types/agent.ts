@@ -44,8 +44,9 @@ export interface SessionMeta {
    *  user can pick the right one to resume at a glance. */
   messageCount?: number;
   /** Project folder this session is bound to (just the folder name,
-   *  not the full path). Populated for new sessions created via the
-   *  project picker, and for archived sessions if the field was saved. */
+   *  not the full path). Set by the New Task project picker, from the
+   *  server's session list (``project``), and from archived sessions on
+   *  disk when the field was saved. The sidebar groups chats by it. */
   project?: string;
   /** ISO datetime when the disk snapshot was last written (only for
    *  archived sessions). */

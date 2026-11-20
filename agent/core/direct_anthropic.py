@@ -1,20 +1,25 @@
 """LiteLLM model-map entries for the direct Anthropic API models.
 
-LiteLLM 1.83's bundled map has no Claude Opus 5.5 / Sonnet 5.5 entries, and
-whether the remote map is fetched at import depends on network access. We
-register both models explicitly so context size, cost tracking and request
-shape are the same on every start.
+LiteLLM 1.83's bundled map has no Claude Opus 5.5 / Fable 5.2 / Sonnet 5.5 /
+Haiku 5.5 entries, and whether the remote map is fetched at import depends on
+network access. We register all four explicitly so context size, cost
+tracking and request shape are the same on every start.
 
 ``supports_reasoning`` is set to ``False`` on purpose: with ``True``, LiteLLM
 1.83 maps a stray ``reasoning_effort`` to ``thinking.type=enabled`` plus
 ``budget_tokens``, which these always-thinking models reject with HTTP 400.
 Effort goes through ``output_config.effort`` instead (see ``llm_params``).
+
+Haiku 5.5 is registered with a 100K input ceiling although its real window is
+1M: prompts over 100K tokens bill at a higher tier (5x input, 5x output) that
+LiteLLM can't express, so compaction keeps it on the base tier.
 """
 
 import litellm
 
 _CONTEXT_WINDOW_TOKENS = 1_000_000
 _MAX_OUTPUT_TOKENS = 128_000
+_HAIKU_BASE_TIER_MAX_INPUT_TOKENS = 100_000
 
 _SHARED_MODEL_INFO = {
     "litellm_provider": "anthropic",
@@ -39,12 +44,27 @@ DIRECT_ANTHROPIC_LITELLM_MODELS: dict[str, dict] = {
         "cache_read_input_token_cost": 2e-7,
         "cache_creation_input_token_cost": 5e-6,
     },
+    "claude-fable-5-2": {
+        **_SHARED_MODEL_INFO,
+        "input_cost_per_token": 8e-6,
+        "output_cost_per_token": 4e-5,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_creation_input_token_cost": 1e-5,
+    },
     "claude-sonnet-5-5": {
         **_SHARED_MODEL_INFO,
         "input_cost_per_token": 2e-6,
         "output_cost_per_token": 1e-5,
-        "cache_read_input_token_cost": 2e-7,
+        "cache_read_input_token_cost": 1e-7,
         "cache_creation_input_token_cost": 2.5e-6,
+    },
+    "claude-haiku-5-5": {
+        **_SHARED_MODEL_INFO,
+        "max_input_tokens": _HAIKU_BASE_TIER_MAX_INPUT_TOKENS,
+        "input_cost_per_token": 1e-7,
+        "output_cost_per_token": 5e-7,
+        "cache_read_input_token_cost": 1e-8,
+        "cache_creation_input_token_cost": 1.25e-7,
     },
 }
 

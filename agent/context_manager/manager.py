@@ -13,7 +13,11 @@ import yaml
 from jinja2 import Template
 from litellm import Message, acompletion
 
-from agent.core.model_ids import is_direct_anthropic_model_id
+from agent.core.llm_response import reply_message
+from agent.core.model_ids import (
+    is_direct_anthropic_model_id,
+    is_direct_openai_model_id,
+)
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
@@ -35,6 +39,12 @@ _SUMMARY_LEAD_IN = (
     "transcript.]"
 )
 _SUMMARY_TRANSCRIPT_END = "[END OF TRANSCRIPT]"
+
+_SUMMARY_EFFORT = "high"
+# Direct OpenAI reasoning shares the summary's output budget, and LiteLLM's
+# Responses API bridge returns a reply cut off by that budget ("incomplete")
+# as if it had finished, so summaries think at "low" there.
+_DIRECT_OPENAI_SUMMARY_EFFORT = "low"
 
 _HF_WHOAMI_URL = "https://huggingface.co/api/whoami-v2"
 _HF_WHOAMI_TIMEOUT = 5  # seconds
@@ -153,6 +163,12 @@ def _direct_anthropic_summary_messages(messages: list[Any], prompt: str) -> list
     return [*system, Message(role="user", content=content)]
 
 
+def _summary_effort(model_name: str) -> str:
+    if is_direct_openai_model_id(model_name):
+        return _DIRECT_OPENAI_SUMMARY_EFFORT
+    return _SUMMARY_EFFORT
+
+
 def _retained_thinking_invalidated(
     first_user_changed: bool, original: list[Any], retained: list[Any]
 ) -> bool:
@@ -194,11 +210,16 @@ async def summarize_messages(
     invisible in telemetry, which used to hide a significant share of hosted
     inference spend.
 
+    Direct OpenAI summaries always get effort "low" and a 16K budget,
+    whatever ``max_tokens`` asks for: the budget includes reasoning, and a
+    summary cut off by it would come back without an error.
+
     Returns ``(summary_text, completion_tokens)``.
     """
     from agent.core.llm_params import _resolve_llm_params
     from agent.core.agent_loop import (
         _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS,
+        _DIRECT_OPENAI_NON_STREAMING_MAX_COMPLETION_TOKENS,
         _scrub_reasoning_for_provider,
     )
 
@@ -206,7 +227,7 @@ async def summarize_messages(
     llm_params = _resolve_llm_params(
         model_name,
         hf_token,
-        reasoning_effort="high",
+        reasoning_effort=_summary_effort(model_name),
     )
     llm_params = with_prompt_cache_params(
         llm_params,
@@ -217,6 +238,8 @@ async def summarize_messages(
         # too) and send the excerpt as one plain-text user turn.
         max_tokens = min(max_tokens, _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS)
         prompt_messages = _direct_anthropic_summary_messages(messages, prompt)
+    elif is_direct_openai_model_id(llm_params.get("model")):
+        max_tokens = _DIRECT_OPENAI_NON_STREAMING_MAX_COMPLETION_TOKENS
     llm_params = {**llm_params, "max_completion_tokens": max_tokens}
     # Mirror the scrubbing the main agent loop does. Without this, DeepSeek
     # thinking-mode 400s on a missing reasoning_content during summarize/restore
@@ -254,7 +277,8 @@ async def summarize_messages(
             if isinstance(usage, dict)
             else None,
         )
-    summary = response.choices[0].message.content or ""
+    # The direct OpenAI bridge can split one reply across choices.
+    summary = reply_message(response).content or ""
     completion_tokens = response.usage.completion_tokens if response.usage else 0
     return summary, completion_tokens
 

@@ -201,11 +201,14 @@ def test_hf_router_params_allow_missing_token_without_headers(monkeypatch):
     import huggingface_hub
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
     monkeypatch.setattr(huggingface_hub, "get_token", lambda: None)
 
     params = _resolve_llm_params("moonshotai/Kimi-K2.7-Code")
 
-    assert params["api_key"] is None
+    # A placeholder, never None: LiteLLM would otherwise send OPENAI_API_KEY
+    # to router.huggingface.co.
+    assert params["api_key"] == "hf-token-missing"
     assert "extra_headers" not in params
 
 

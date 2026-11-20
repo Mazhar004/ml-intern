@@ -18,6 +18,8 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from agent.context_manager import manager as context_manager_module  # noqa: E402
 from agent.core.model_ids import (  # noqa: E402
+    CLAUDE_FABLE_52_MODEL_ID,
+    CLAUDE_HAIKU_55_MODEL_ID,
     CLAUDE_OPUS_48_MODEL_ID,
     CLAUDE_OPUS_55_MODEL_ID,
     CLAUDE_SONNET_55_MODEL_ID,
@@ -37,6 +39,14 @@ MISSING_KEY_MESSAGE = (
     "Claude via the Anthropic API needs ANTHROPIC_API_KEY. Add it to the repo "
     ".env and restart the backend."
 )
+# Direct Claude picker entries, in display order, with their labels.
+DIRECT_CLAUDE_LABELS = {
+    CLAUDE_OPUS_55_MODEL_ID: "Claude Opus 5.5",
+    CLAUDE_FABLE_52_MODEL_ID: "Claude Fable 5.2",
+    CLAUDE_SONNET_55_MODEL_ID: "Claude Sonnet 5.5",
+    CLAUDE_HAIKU_55_MODEL_ID: "Claude Haiku 5.5",
+}
+DIRECT_CLAUDE_IDS = list(DIRECT_CLAUDE_LABELS)
 
 
 class _JsonRequest:
@@ -92,37 +102,33 @@ def _llm_call(model: str, cost_usd: float) -> dict:
 # ── Picker ──────────────────────────────────────────────────────────────
 
 
-def test_picker_lists_direct_claude_55_models_right_after_router_opus_48():
+def test_picker_lists_direct_claude_models_right_after_router_opus_48():
     # Arrange
     ids = [model["id"] for model in agent.AVAILABLE_MODELS]
     models = {model["id"]: model for model in agent.AVAILABLE_MODELS}
 
     # Act
     router_index = ids.index(CLAUDE_OPUS_48_MODEL_ID)
+    following = ids[router_index + 1 : router_index + 1 + len(DIRECT_CLAUDE_IDS)]
 
     # Assert
-    assert ids[router_index + 1] == CLAUDE_OPUS_55_MODEL_ID
-    assert ids[router_index + 2] == CLAUDE_SONNET_55_MODEL_ID
+    assert following == DIRECT_CLAUDE_IDS
     assert models[CLAUDE_OPUS_55_MODEL_ID] == {
         "id": CLAUDE_OPUS_55_MODEL_ID,
         "label": "Claude Opus 5.5",
         "recommended": True,
     }
-    assert models[CLAUDE_SONNET_55_MODEL_ID] == {
-        "id": CLAUDE_SONNET_55_MODEL_ID,
-        "label": "Claude Sonnet 5.5",
-    }
+    for model_id in DIRECT_CLAUDE_IDS[1:]:
+        assert models[model_id] == {
+            "id": model_id,
+            "label": DIRECT_CLAUDE_LABELS[model_id],
+        }
     assert models[CLAUDE_OPUS_48_MODEL_ID]["label"] == "Claude Opus 4.8"
 
 
 @pytest.mark.parametrize(
     "model_id",
-    [
-        CLAUDE_OPUS_55_MODEL_ID,
-        CLAUDE_SONNET_55_MODEL_ID,
-        DEEPSEEK_PRO_ID,
-        DEEPSEEK_FLASH_ID,
-    ],
+    [*DIRECT_CLAUDE_IDS, DEEPSEEK_PRO_ID, DEEPSEEK_FLASH_ID],
 )
 def test_direct_provider_ids_do_not_require_hf_router_token(model_id):
     assert agent._model_requires_hf_router_token(model_id) is False
@@ -175,7 +181,36 @@ async def test_switch_to_direct_claude_without_key_is_rejected_clearly(
 
 
 @pytest.mark.asyncio
-async def test_switch_to_direct_claude_with_key_is_allowed(monkeypatch):
+@pytest.mark.parametrize("model_id", DIRECT_CLAUDE_IDS)
+async def test_switch_to_direct_claude_without_key_names_its_label(
+    monkeypatch, model_id
+):
+    # Arrange
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _install_session_access(monkeypatch)
+    updated = _install_model_updates(monkeypatch)
+
+    # Act
+    with pytest.raises(HTTPException) as exc_info:
+        await agent.set_session_model(
+            "s1",
+            {"model": model_id},
+            request=None,
+            user={"user_id": "u1"},
+        )
+
+    # Assert
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == (
+        f"{DIRECT_CLAUDE_LABELS[model_id]} needs ANTHROPIC_API_KEY on the server. "
+        "Add it to the repo .env and restart the backend."
+    )
+    assert updated == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", DIRECT_CLAUDE_IDS)
+async def test_switch_to_direct_claude_with_key_is_allowed(monkeypatch, model_id):
     # Arrange
     monkeypatch.setenv("ANTHROPIC_API_KEY", DUMMY_ANTHROPIC_KEY)
     _install_session_access(monkeypatch)
@@ -184,14 +219,14 @@ async def test_switch_to_direct_claude_with_key_is_allowed(monkeypatch):
     # Act
     response = await agent.set_session_model(
         "s1",
-        {"model": CLAUDE_SONNET_55_MODEL_ID},
+        {"model": model_id},
         request=None,
         user={"user_id": "u1"},
     )
 
     # Assert
-    assert response == {"session_id": "s1", "model": CLAUDE_SONNET_55_MODEL_ID}
-    assert updated == [("s1", CLAUDE_SONNET_55_MODEL_ID)]
+    assert response == {"session_id": "s1", "model": model_id}
+    assert updated == [("s1", model_id)]
 
 
 @pytest.mark.asyncio
@@ -438,8 +473,7 @@ def _manager_with_summary_session(model_name: str) -> SessionManager:
 @pytest.mark.parametrize(
     ("model_name", "expected_max_tokens"),
     [
-        (CLAUDE_OPUS_55_MODEL_ID, 16_000),
-        (CLAUDE_SONNET_55_MODEL_ID, 16_000),
+        *((model_id, 16_000) for model_id in DIRECT_CLAUDE_IDS),
         (CLAUDE_OPUS_48_MODEL_ID, 4000),
         (GLM_52_MODEL_ID, 4000),
     ],
@@ -501,12 +535,7 @@ async def test_seed_from_summary_without_anthropic_key_fails_before_any_call(
 
 @pytest.mark.parametrize(
     "model_id",
-    [
-        CLAUDE_OPUS_55_MODEL_ID,
-        CLAUDE_SONNET_55_MODEL_ID,
-        DEEPSEEK_PRO_ID,
-        DEEPSEEK_FLASH_ID,
-    ],
+    [*DIRECT_CLAUDE_IDS, DEEPSEEK_PRO_ID, DEEPSEEK_FLASH_ID],
 )
 def test_saved_direct_provider_model_survives_lazy_restore(model_id):
     assert SessionManager._model_from_saved_metadata(model_id) == model_id

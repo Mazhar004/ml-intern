@@ -4,13 +4,15 @@ import type { SessionMeta } from '@/types/agent';
 import { deleteMessages, moveMessages } from '@/lib/chat-message-store';
 import { moveBackendMessages, deleteBackendMessages } from '@/lib/backend-message-store';
 import { safeLocalStorage, setActiveSessionSource } from '@/lib/safeStorage';
+import { normalizeProjectName } from '@/utils/sessionGroups';
 
 interface SessionStore {
   sessions: SessionMeta[];
   activeSessionId: string | null;
 
   // Actions
-  createSession: (id: string, model?: string | null) => void;
+  /** `project` is the folder picked in New Task (blank or omitted: none). */
+  createSession: (id: string, model?: string | null, project?: string | null) => void;
   deleteSession: (id: string) => void;
   switchSession: (id: string) => void;
   setSessionActive: (id: string, isActive: boolean) => void;
@@ -40,6 +42,8 @@ interface SessionStore {
     is_active?: boolean;
     is_processing?: boolean;
     model?: string | null;
+    /** Project folder name, when the session is bound to one. */
+    project?: string | null;
     pending_approval?: unknown[] | null;
     auto_approval?: {
       enabled?: boolean;
@@ -87,13 +91,26 @@ function withArchivedCustomTitle(
   return { ...session, title: row.title, titleIsCustom: true };
 }
 
+/** Rows saved before the project was tracked locally take it from disk. */
+function withArchivedProject(
+  session: SessionMeta,
+  archivedById: Map<string, ArchivedSessionRow>,
+): SessionMeta {
+  if (session.project) return session;
+  const row =
+    archivedById.get(session.id) ??
+    (session.sourceArchiveId ? archivedById.get(session.sourceArchiveId) : undefined);
+  const project = normalizeProjectName(row?.project);
+  return project ? { ...session, project } : session;
+}
+
 export const useSessionStore = create<SessionStore>()(
   persist(
     (set, get) => ({
       sessions: [],
       activeSessionId: null,
 
-      createSession: (id: string, model?: string | null) => {
+      createSession: (id: string, model?: string | null, project?: string | null) => {
         const now = new Date().toISOString();
         const newSession: SessionMeta = {
           id,
@@ -103,6 +120,7 @@ export const useSessionStore = create<SessionStore>()(
           isActive: true,
           needsAttention: false,
           model: model ?? null,
+          project: normalizeProjectName(project) ?? undefined,
           autoApprovalEnabled: false,
           autoApprovalCostCapUsd: null,
           autoApprovalEstimatedSpendUsd: 0,
@@ -163,6 +181,8 @@ export const useSessionStore = create<SessionStore>()(
                 isActive: server.is_active ?? existing.isActive,
                 isProcessing: Boolean(server.is_processing),
                 model: server.model ?? existing.model ?? null,
+                // The server's folder name wins; rows it doesn't know keep theirs.
+                project: normalizeProjectName(server.project) ?? existing.project,
                 usageWindowStartedAt:
                   server.usage_window_started_at ?? existing.usageWindowStartedAt ?? null,
                 needsAttention: Boolean(server.pending_approval?.length) || existing.needsAttention,
@@ -191,6 +211,7 @@ export const useSessionStore = create<SessionStore>()(
               isProcessing: Boolean(server.is_processing),
               needsAttention: Boolean(server.pending_approval?.length),
               model: server.model ?? null,
+              project: normalizeProjectName(server.project) ?? undefined,
               expired: false,
               autoApprovalEnabled: Boolean(server.auto_approval?.enabled),
               autoApprovalCostCapUsd: server.auto_approval?.cost_cap_usd ?? null,
@@ -321,7 +342,7 @@ export const useSessionStore = create<SessionStore>()(
             // to a fresh in-memory id but the disk file kept the original.
             if (s.sourceArchiveId && archivedIds.has(s.sourceArchiveId)) return true;
             return false; // stale → drop
-          }).map((s) => withArchivedCustomTitle(s, archivedById));
+          }).map((s) => withArchivedProject(withArchivedCustomTitle(s, archivedById), archivedById));
           // knownIds includes BOTH the current row id AND its sourceArchiveId
           // (set when "Catch me up" renamed the row). Without this, a reload
           // after Catch me up would re-add the original archive as a NEW

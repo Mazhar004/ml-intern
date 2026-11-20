@@ -15,7 +15,7 @@ from litellm import (
     Message,
     acompletion,
 )
-from litellm.exceptions import ContextWindowExceededError
+from litellm.exceptions import APIConnectionError, ContextWindowExceededError
 
 from agent.config import Config
 from agent.core.approval_policy import (
@@ -32,7 +32,12 @@ from agent.core.hf_access import (
     is_inference_billing_error,
 )
 from agent.core.llm_params import MissingProviderKeyError, _resolve_llm_params
-from agent.core.model_ids import is_direct_anthropic_model_id
+from agent.core.llm_response import reply_finish_reason, reply_message
+from agent.core.model_ids import (
+    is_direct_anthropic_model_id,
+    is_direct_openai_model_id,
+)
+from agent.core.provider_errors import is_output_cap_error, openai_error_kind
 from agent.core.prompt_caching import (
     router_session_id_for,
     with_prompt_cache_params,
@@ -532,18 +537,59 @@ def _is_anthropic_bad_request(error: Exception) -> bool:
     )
 
 
-def _retry_delay_for(error: Exception, attempt_index: int) -> int | None:
-    """Return the delay for this retry attempt, or None if it should not retry."""
-    if _is_anthropic_bad_request(error):
+# Server-side failures worth retrying on the direct OpenAI route, whose JSON
+# error bodies rarely contain the substrings ``_is_transient_error`` matches.
+_RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+def _is_final_direct_openai_error(error: Exception) -> bool:
+    """A direct OpenAI error that fails the same way on every retry.
+
+    400s can echo the request, so substring checks like "timeout" must not
+    see them; an exhausted quota (a 429) doesn't refill between retries; and
+    a reply cut off by the output cap would be cut off again.
+    """
+    return (
+        getattr(error, "status_code", None) == 400
+        or openai_error_kind(error) == "quota"
+        or is_output_cap_error(error)
+    )
+
+
+def _is_direct_openai_server_error(error: Exception) -> bool:
+    # LiteLLM tags its own APIConnectionError with status 500; real network
+    # failures among them are caught by the "connection error" text instead.
+    if isinstance(error, APIConnectionError):
+        return False
+    return getattr(error, "status_code", None) in _RETRYABLE_SERVER_STATUS_CODES
+
+
+def _retry_schedule_for(error: Exception, model_name: str | None) -> list[int] | None:
+    direct_openai = is_direct_openai_model_id(model_name)
+    if direct_openai and _is_final_direct_openai_error(error):
         return None
     if _is_rate_limit_error(error):
-        schedule = _LLM_RATE_LIMIT_RETRY_DELAYS
-    elif _is_transient_error(error):
-        schedule = _LLM_RETRY_DELAYS
-    else:
-        return None
+        return _LLM_RATE_LIMIT_RETRY_DELAYS
+    if _is_transient_error(error):
+        return _LLM_RETRY_DELAYS
+    if direct_openai and _is_direct_openai_server_error(error):
+        return _LLM_RETRY_DELAYS
+    return None
 
-    if attempt_index >= len(schedule):
+
+def _retry_delay_for(
+    error: Exception, attempt_index: int, model_name: str | None = None
+) -> int | None:
+    """Return the delay for this retry attempt, or None if it should not retry.
+
+    ``model_name`` is the call's LiteLLM model (``llm_params["model"]``). It,
+    not the error's ``llm_provider``, decides whether the direct OpenAI rules
+    apply: HF Router errors are tagged "openai" too.
+    """
+    if _is_anthropic_bad_request(error):
+        return None
+    schedule = _retry_schedule_for(error, model_name)
+    if schedule is None or attempt_index >= len(schedule):
         return None
     return schedule[attempt_index]
 
@@ -722,6 +768,49 @@ def _anthropic_error_message(error: Exception, err_str: str) -> str | None:
     return None
 
 
+_OPENAI_AUTH_MESSAGE = (
+    "OpenAI rejected the API key: OPENAI_API_KEY is missing or invalid. "
+    "Set it in the repo .env and restart the backend."
+)
+_OPENAI_BILLING_URL = (
+    "https://platform.openai.com/settings/organization/billing/overview"
+)
+_OPENAI_QUOTA_MESSAGE = (
+    "Your OpenAI API quota is exhausted (insufficient_quota).\n\n"
+    "Add credits or raise your usage limits in the OpenAI dashboard: "
+    f"{_OPENAI_BILLING_URL}"
+)
+_OPENAI_MODEL_ACCESS_MESSAGE = (
+    "Your OpenAI API key can't use this model (model_not_found). Check the "
+    "project's model access in the OpenAI dashboard, or pick another model."
+)
+_OPENAI_ERROR_MESSAGES = {
+    "auth": _OPENAI_AUTH_MESSAGE,
+    "quota": _OPENAI_QUOTA_MESSAGE,
+    "model_access": _OPENAI_MODEL_ACCESS_MESSAGE,
+}
+
+
+def _is_direct_openai_error(error: Exception, model_name: str | None) -> bool:
+    """An error from a direct OpenAI call, decided by the session model.
+
+    Router errors carry ``llm_provider == "openai"`` as well, so the model id
+    decides. An error tagged with another provider keeps that handling.
+    """
+    if not is_direct_openai_model_id(model_name):
+        return False
+    provider = getattr(error, "llm_provider", None)
+    return not provider or provider == "openai"
+
+
+def _openai_error_message(error: Exception) -> str | None:
+    if is_output_cap_error(error):
+        # A non-streaming reply cut off before any text (OpenAI said
+        # "incomplete"); LiteLLM's bridge raises instead of returning it.
+        return _EMPTY_LENGTH_STOP_MESSAGE
+    return _OPENAI_ERROR_MESSAGES.get(openai_error_kind(error))
+
+
 def _model_not_found_message(err_str: str) -> str | None:
     if "model_not_found" in err_str or (
         "model" in err_str and ("not found" in err_str or "does not exist" in err_str)
@@ -751,6 +840,10 @@ def _friendly_error_message(
         return _anthropic_error_message(error, err_str) or _model_not_found_message(
             _error_head(err_str)
         )
+
+    if _is_direct_openai_error(error, model_name):
+        # Never fall through to the HF token / HF credits wording below.
+        return _openai_error_message(error)
 
     if _is_auth_error_text(err_str):
         return (
@@ -1326,42 +1419,86 @@ _EMPTY_LENGTH_STOP_MESSAGE = (
     "(finish_reason=length). Try again, lower the reasoning effort, or ask "
     "for a smaller step."
 )
+_CONTENT_FILTER_STOP_MESSAGE = (
+    "The model stopped without a reply (content_filter). Rephrase the "
+    "request or switch models to continue."
+)
+
+
+def _is_empty_turn(llm_result: LLMResult) -> bool:
+    return not llm_result.content and not llm_result.tool_calls_acc
+
+
+def _direct_anthropic_stop_message(llm_result: LLMResult) -> str | None:
+    # LiteLLM maps Anthropic's ``refusal`` stop reason to ``content_filter``.
+    if llm_result.finish_reason == "content_filter":
+        return _CLAUDE_REFUSAL_MESSAGE
+    if llm_result.finish_reason == "length" and _is_empty_turn(llm_result):
+        return _EMPTY_LENGTH_STOP_MESSAGE
+    return None
+
+
+def _direct_openai_stop_message(llm_result: LLMResult) -> str | None:
+    if llm_result.finish_reason == "content_filter":
+        return _CONTENT_FILTER_STOP_MESSAGE
+    if not _is_empty_turn(llm_result):
+        return None
+    if llm_result.finish_reason == "length":
+        return _EMPTY_LENGTH_STOP_MESSAGE
+    # LiteLLM's Responses bridge drops the ``response.incomplete`` event and
+    # its usage, so a stream cut off by the output cap ends as an empty
+    # "stop" without a usage chunk. A completed response always has usage.
+    if llm_result.finish_reason == "stop" and not llm_result.token_count:
+        return _EMPTY_LENGTH_STOP_MESSAGE
+    return None
 
 
 def _unproductive_stop_message(
     llm_result: LLMResult, model_name: str | None
 ) -> str | None:
-    """Message for a direct Anthropic turn without usable output, else None.
+    """Message for a direct-API turn without usable output, else None.
 
-    LiteLLM maps Anthropic's ``refusal`` stop reason to ``content_filter``.
-    A ``length`` stop with no text and no tool calls means the whole output
-    budget went to thinking. Other routes (HF Router incl. router Claude,
-    DeepSeek, local) always get None and keep their usual stop handling.
+    Direct Anthropic and direct OpenAI only. A stop with no text and no tool
+    calls after the output cap means the whole budget went to reasoning; a
+    ``content_filter`` stop is a refusal. Other routes (HF Router incl.
+    router Claude and router GPT-5.5, DeepSeek, local) always get None and
+    keep their usual stop handling.
     """
-    if not is_direct_anthropic_model_id(model_name):
-        return None
-    if llm_result.finish_reason == "content_filter":
-        return _CLAUDE_REFUSAL_MESSAGE
-    if (
-        llm_result.finish_reason == "length"
-        and not llm_result.content
-        and not llm_result.tool_calls_acc
-    ):
-        return _EMPTY_LENGTH_STOP_MESSAGE
+    if is_direct_anthropic_model_id(model_name):
+        return _direct_anthropic_stop_message(llm_result)
+    if is_direct_openai_model_id(model_name):
+        return _direct_openai_stop_message(llm_result)
     return None
 
 
-# Non-streaming calls to the direct Anthropic API keep max_tokens (shared with
-# always-on thinking) at about 16K; larger values risk HTTP timeouts.
+# Non-streaming calls to the direct APIs keep the output budget (shared with
+# thinking / reasoning) at about 16K; larger values risk HTTP timeouts.
 _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS = 16_000
+_DIRECT_OPENAI_NON_STREAMING_MAX_COMPLETION_TOKENS = 16_000
+
+
+def _with_capped_budget(llm_params: dict, key: str, cap: int) -> dict:
+    return {**llm_params, key: min(llm_params.get(key) or cap, cap)}
 
 
 def _with_non_streaming_max_tokens(llm_params: dict) -> dict:
-    """Cap max_tokens for a non-streaming direct Anthropic call; else unchanged."""
-    if not is_direct_anthropic_model_id(llm_params.get("model")):
-        return llm_params
-    cap = _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS
-    return {**llm_params, "max_tokens": min(llm_params.get("max_tokens") or cap, cap)}
+    """Cap the output budget of a non-streaming direct-API call; else unchanged.
+
+    Direct Anthropic caps ``max_tokens``; direct OpenAI caps
+    ``max_completion_tokens`` (its only budget key).
+    """
+    model = llm_params.get("model")
+    if is_direct_anthropic_model_id(model):
+        return _with_capped_budget(
+            llm_params, "max_tokens", _DIRECT_ANTHROPIC_NON_STREAMING_MAX_TOKENS
+        )
+    if is_direct_openai_model_id(model):
+        return _with_capped_budget(
+            llm_params,
+            "max_completion_tokens",
+            _DIRECT_OPENAI_NON_STREAMING_MAX_COMPLETION_TOKENS,
+        )
+    return llm_params
 
 
 def _attempts_exhausted_error(last_error: Exception | None) -> Exception:
@@ -1550,7 +1687,7 @@ async def _call_llm_streaming(
                 _healed_thinking_signature = True
                 messages = healed_messages
                 continue
-            _delay = _retry_delay_for(e, _llm_attempt)
+            _delay = _retry_delay_for(e, _llm_attempt, llm_params.get("model"))
             if _llm_attempt < _MAX_LLM_RETRIES - 1 and _delay is not None:
                 logger.warning(
                     "Transient LLM error (attempt %d/%d): %s — retrying in %ds",
@@ -1651,7 +1788,7 @@ async def _call_llm_non_streaming(
                 _healed_thinking_signature = True
                 messages = healed_messages
                 continue
-            _delay = _retry_delay_for(e, _llm_attempt)
+            _delay = _retry_delay_for(e, _llm_attempt, llm_params.get("model"))
             if _llm_attempt < _MAX_LLM_RETRIES - 1 and _delay is not None:
                 logger.warning(
                     "Transient LLM error (attempt %d/%d): %s — retrying in %ds",
@@ -1682,12 +1819,12 @@ async def _call_llm_non_streaming(
     if response is None:
         raise _attempts_exhausted_error(last_error)
 
-    choice = response.choices[0]
-    message = choice.message
+    # The direct OpenAI bridge can split one reply across choices.
+    message = reply_message(response)
     content = message.content or None
     reasoning_content = getattr(message, "reasoning_content", None) or None
     thinking_blocks = _thinking_blocks_from_message(message)
-    finish_reason = choice.finish_reason
+    finish_reason = reply_finish_reason(response)
     token_count = response.usage.total_tokens if response.usage else 0
 
     # Build tool_calls_acc in the same format as streaming
@@ -1927,11 +2064,12 @@ class Handlers:
                 token_count = llm_result.token_count
                 finish_reason = llm_result.finish_reason
 
-                # Direct Anthropic only: a refusal or an output budget spent
-                # before any reply must not look like an empty successful turn.
-                # Say so and end the turn, without the plan-continuation guard
-                # re-prompting it. Nothing from the turn is stored. Every other
-                # route gets None here and keeps its existing stop handling.
+                # Direct Anthropic / OpenAI only: a refusal or an output budget
+                # spent before any reply must not look like an empty successful
+                # turn. Say so and end the turn, without the plan-continuation
+                # guard re-prompting it. Nothing from the turn is stored. Every
+                # other route gets None here and keeps its existing stop
+                # handling.
                 stop_message = _unproductive_stop_message(
                     llm_result, llm_params.get("model")
                 )
