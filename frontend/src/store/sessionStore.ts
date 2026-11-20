@@ -406,7 +406,12 @@ export const useSessionStore = create<SessionStore>()(
               .trim()
               .slice(0, 60);
             if (!t || t === 'archived session') return `id::${s.id}`;
-            return `${s.project || ''}::${t}`;
+            // Only archive rows key on their project. Live rows carry one too
+            // (for the sidebar's project groups), but keying on it would fold
+            // a live chat into an unrelated archived chat of that project
+            // whose first message matches the live chat's title.
+            const project = s.archivePreview === undefined ? '' : s.project || '';
+            return `${project}::${t}`;
           };
           // Pick the best representative of a duplicate group: a live
           // (in-memory) session always beats an archive; otherwise keep the

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -8,28 +8,36 @@ import {
   DialogContent,
   DialogContentText,
   DialogTitle,
-  IconButton,
   Snackbar,
   Typography,
   CircularProgress,
   Divider,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
-import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { useUsageStore } from '@/store/usageStore';
 import { apiFetch } from '@/utils/api';
-import { safeSetItem } from '@/lib/safeStorage';
+import { safeGetItem, safeSetItem } from '@/lib/safeStorage';
+import { normalizeSessionTitle, saveSessionTitle } from '@/utils/sessionTitle';
 import {
-  normalizeSessionTitle,
-  saveSessionTitle,
-  sessionDisplayTitle,
-} from '@/utils/sessionTitle';
+  ALL_PROJECTS,
+  countWaitingByGroup,
+  groupSessionsByProject,
+  normalizeProjectName,
+  projectFolderName,
+  projectGroupKey,
+} from '@/utils/sessionGroups';
 import type { SessionMeta } from '@/types/agent';
-import SessionTitleEditor from './SessionTitleEditor';
+import ProjectFilter, { type ProjectFilterOption } from './ProjectFilter';
+import ProjectGroupSection from './ProjectGroupSection';
+import SessionRow from './SessionRow';
+import { useCollapsedGroups, useProjectFilter } from './useProjectPrefs';
+
+const LAST_PROJECT_STORAGE_KEY = 'ml-intern.lastProject';
+const ALL_PROJECTS_LABEL = 'All projects';
+const NO_PROJECT_LABEL = 'No project';
 
 interface SessionSidebarProps {
   onClose?: () => void;
@@ -47,10 +55,63 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     setSessionTitle,
   } =
     useSessionStore();
-  const { setPlan, clearPanel } =
-    useAgentStore();
+  // Select just these actions: subscribing to the whole agent store would
+  // re-render the sidebar on every streamed agent update.
+  const setPlan = useAgentStore((s) => s.setPlan);
+  const clearPanel = useAgentStore((s) => s.clearPanel);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [capacityError, setCapacityError] = useState<string | null>(null);
+  // Set once the mount-time server merges below have finished (or failed).
+  const [serverListsMerged, setServerListsMerged] = useState(false);
+
+  // -- Project groups + filter ----------------------------------------------
+  // Rows keep the flat list's order (newest added first) inside each group.
+  const newestFirst = useMemo(() => [...sessions].reverse(), [sessions]);
+  const groups = useMemo(() => groupSessionsByProject(newestFirst), [newestFirst]);
+  const hasProjects = groups.some((group) => group.project !== null);
+  // 1-based position in store order: numbers the "Session NN" fallback title.
+  const rowNumbers = useMemo(
+    () => new Map(sessions.map((session, index) => [session.id, index + 1])),
+    [sessions],
+  );
+  const { projectFilter, selectProjectFilter, revealGroup } = useProjectFilter(
+    groups,
+    serverListsMerged,
+  );
+  const filteredGroup =
+    projectFilter === ALL_PROJECTS ? undefined : groups.find((g) => g.key === projectFilter);
+  // Chats waiting for a tool approval, per group: a collapsed or filtered-out
+  // group hides their rows' dots, so its header and filter option show one.
+  const waitingByGroup = useMemo(
+    () => countWaitingByGroup(groups, activeSessionId),
+    [groups, activeSessionId],
+  );
+  const filterOptions = useMemo<ProjectFilterOption[]>(
+    () => [
+      { value: ALL_PROJECTS, label: ALL_PROJECTS_LABEL, count: sessions.length, waiting: 0 },
+      ...groups.map((group) => ({
+        value: group.key,
+        label: group.project ?? NO_PROJECT_LABEL,
+        count: group.count,
+        waiting: waitingByGroup.get(group.key) ?? 0,
+      })),
+    ],
+    [groups, sessions.length, waitingByGroup],
+  );
+  const activeGroupKey = useMemo(() => {
+    const active = sessions.find((session) => session.id === activeSessionId);
+    return active ? projectGroupKey(normalizeProjectName(active.project)) : null;
+  }, [sessions, activeSessionId]);
+  const { collapsed, toggleGroup } = useCollapsedGroups(activeSessionId, activeGroupKey);
+  // New Task pre-fills the filtered project ('' for "No project"); without a
+  // filter it falls back to the last-used project.
+  const prefillProject = filteredGroup ? (filteredGroup.project ?? '') : null;
+
+  // A filter that would hide a just-created chat switches to its project.
+  const revealInFilter = useCallback(
+    (project: string) => revealGroup(projectGroupKey(normalizeProjectName(project))),
+    [revealGroup],
+  );
 
   // -- Hydrate the sidebar on mount ----------------------------------------
   // Two sources, merged: (1) /api/sessions — live/durable sessions the
@@ -82,7 +143,9 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
       } catch {
         // best-effort: archived listing is a convenience, not load-bearing
       }
-    })();
+    })().finally(() => {
+      if (!cancelled) setServerListsMerged(true);
+    });
     return () => {
       cancelled = true;
     };
@@ -96,18 +159,19 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     setCapacityError(null);
     // Set once the backend has created the session: after that, a failing
     // local step must not be reported as "Failed to create session.".
-    let created: { id: string; model?: string | null } | null = null;
+    let created: { id: string; model?: string | null; project: string } | null = null;
     try {
       // Project picker: prompt for the project folder this session lives in.
       // Empty input → no project sandbox (server-wide ML_INTERN_PROJECT_ROOT
-      // env var still applies if set). Pre-fill the last-used project from
-      // localStorage so jumping between sessions on the same project is fast.
+      // env var still applies if set). Pre-fill the filtered project, else
+      // the last-used one from localStorage, so jumping between sessions on
+      // the same project is fast.
       let existing: { name: string }[] = [];
       try {
         const r = await apiFetch('/api/projects');
         if (r.ok) existing = await r.json();
       } catch { /* listing is best-effort */ }
-      const last = localStorage.getItem('ml-intern.lastProject') || '';
+      const last = prefillProject ?? safeGetItem(LAST_PROJECT_STORAGE_KEY) ?? '';
       const hint = existing.length
         ? `\n\nExisting projects:\n  ${existing.map((p) => p.name).join('\n  ')}`
         : '';
@@ -121,8 +185,11 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         return;
       }
       const trimmed = project.trim();
-      if (trimmed) {
-        safeSetItem('ml-intern.lastProject', trimmed);
+      // The backend files the chat under a cleaned-up folder name ("a/b" is
+      // folder "a-b"); group, filter and pre-fill with that same name.
+      const folder = projectFolderName(trimmed);
+      if (folder) {
+        safeSetItem(LAST_PROJECT_STORAGE_KEY, folder);
       }
 
       const response = await apiFetch('/api/session', {
@@ -142,20 +209,22 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
       if (typeof data.session_id !== 'string' || !data.session_id) {
         throw new Error('POST /api/session returned no session_id');
       }
-      created = { id: data.session_id, model: data.model };
-      createSession(data.session_id, data.model);
+      created = { id: data.session_id, model: data.model, project: folder };
+      createSession(data.session_id, data.model, folder);
+      revealInFilter(folder);
       void useUsageStore.getState().fetchUsage(data.session_id);
       setPlan([]);
       clearPanel();
       onClose?.();
     } catch (error) {
       if (created) {
-        const { id, model } = created;
+        const { id, model, project } = created;
         console.error(`Session ${id} was created, but setting it up locally failed:`, error);
         // Best effort: the backend session exists, so still put it on screen.
         try {
           if (useSessionStore.getState().sessions.some((s) => s.id === id)) switchSession(id);
-          else createSession(id, model);
+          else createSession(id, model, project);
+          revealInFilter(project);
           onClose?.();
         } catch (switchError) {
           console.error(`Could not switch to new session ${id}:`, switchError);
@@ -167,7 +236,16 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     } finally {
       setIsCreatingSession(false);
     }
-  }, [isCreatingSession, createSession, switchSession, setPlan, clearPanel, onClose]);
+  }, [
+    isCreatingSession,
+    prefillProject,
+    createSession,
+    revealInFilter,
+    switchSession,
+    setPlan,
+    clearPanel,
+    onClose,
+  ]);
 
   // -- Delete with dialog confirmation ------------------------------------
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -203,10 +281,23 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
           apiFetch(`/api/sessions/archived/${id}`, { method: 'DELETE' }),
         ),
       ]);
-      deleteSession(sessionId);
     } catch {
-      deleteSession(sessionId);
+      /* best effort: the local row is removed below either way */
     }
+    // Deleting the open chat makes the store open the newest chat left, which
+    // a project filter may hide: open the filtered project's newest instead.
+    const { sessions: current, activeSessionId: openId } = useSessionStore.getState();
+    if (openId === sessionId && projectFilter !== ALL_PROJECTS) {
+      const next = [...current]
+        .reverse()
+        .find(
+          (s) =>
+            s.id !== sessionId &&
+            projectGroupKey(normalizeProjectName(s.project)) === projectFilter,
+        );
+      if (next) switchSession(next.id);
+    }
+    deleteSession(sessionId);
 
     // If this was the last session, create a new one
     if (isLastSession) {
@@ -226,7 +317,17 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
 
     setIsDeleting(false);
     setConfirmDeleteId(null);
-  }, [deleteSession, confirmDeleteId, isDeleting, sessions, createSession, setPlan, clearPanel]);
+  }, [
+    deleteSession,
+    confirmDeleteId,
+    isDeleting,
+    sessions,
+    projectFilter,
+    switchSession,
+    createSession,
+    setPlan,
+    clearPanel,
+  ]);
 
   const handleSelect = useCallback(
     (sessionId: string) => {
@@ -263,6 +364,8 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     setEditingId(sessionId);
   }, []);
 
+  const cancelRename = useCallback(() => setEditingId(null), []);
+
   // Optimistic: show the new name at once, revert if the server rejects it.
   const commitRename = useCallback(
     async (session: SessionMeta, raw: string, shownTitle: string) => {
@@ -284,10 +387,46 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     [setSessionTitle],
   );
 
-  const formatTime = (d: string) =>
-    new Date(d).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
   // -- Render -------------------------------------------------------------
+
+  const renderRow = (session: SessionMeta) => (
+    <SessionRow
+      key={session.id}
+      session={session}
+      num={rowNumbers.get(session.id) ?? 0}
+      isSelected={session.id === activeSessionId}
+      isEditing={session.id === editingId}
+      onSelect={handleSelect}
+      onStartRename={startRename}
+      onCommitRename={commitRename}
+      onCancelRename={cancelRename}
+      onDeleteClick={handleDeleteClick}
+    />
+  );
+
+  // Flat list until some chat has a project; then one collapsible section
+  // per project, or only the filtered project's chats.
+  const renderSessionList = () => {
+    if (!hasProjects) return newestFirst.map(renderRow);
+    if (filteredGroup) return filteredGroup.sessions.map(renderRow);
+    return groups.map((group) => {
+      const expanded = !collapsed.has(group.key);
+      return (
+        <ProjectGroupSection
+          key={group.key}
+          groupKey={group.key}
+          label={group.project ?? NO_PROJECT_LABEL}
+          count={group.count}
+          waiting={waitingByGroup.get(group.key) ?? 0}
+          isProject={group.project !== null}
+          expanded={expanded}
+          onToggle={toggleGroup}
+        >
+          {expanded && group.sessions.map(renderRow)}
+        </ProjectGroupSection>
+      );
+    });
+  };
 
   return (
     <Box
@@ -313,6 +452,17 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
           Recent chats
         </Typography>
       </Box>
+
+      {/* -- Project filter (once any chat has a project) ------------------ */}
+      {hasProjects && (
+        <Box sx={{ px: 1.5, pt: 1 }}>
+          <ProjectFilter
+            value={projectFilter}
+            options={filterOptions}
+            onChange={selectProjectFilter}
+          />
+        </Box>
+      )}
 
       {/* -- Capacity error ------------------------------------------------ */}
       {capacityError && (
@@ -375,173 +525,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
             </Typography>
           </Box>
         ) : (
-          [...sessions].reverse().map((session, index) => {
-            const num = sessions.length - index;
-            const isSelected = session.id === activeSessionId;
-            const isEditing = session.id === editingId;
-            const shownTitle = sessionDisplayTitle(session, num);
-
-            return (
-              <Box
-                key={session.id}
-                onClick={() => handleSelect(session.id)}
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 1,
-                  px: 1.5,
-                  py: 0.875,
-                  mx: 0.75,
-                  mb: 0.2,
-                  borderRadius: '10px',
-                  cursor: 'pointer',
-                  transition: 'background-color 0.12s ease',
-                  bgcolor: isSelected
-                    ? 'var(--hover-bg)'
-                    : 'transparent',
-                  '&:hover': {
-                    bgcolor: 'var(--hover-bg)',
-                  },
-                  '& .delete-btn, & .rename-btn': {
-                    opacity: 0,
-                    transition: 'opacity 0.12s',
-                  },
-                  '&:hover .delete-btn, &:hover .rename-btn, & .rename-btn:focus-visible': {
-                    opacity: 1,
-                  },
-                }}
-              >
-                <ChatBubbleOutlineIcon
-                  sx={{
-                    fontSize: 15,
-                    color: isSelected ? 'var(--text)' : 'var(--muted-text)',
-                    opacity: isSelected ? 0.8 : 0.4,
-                    flexShrink: 0,
-                  }}
-                />
-
-                <Box sx={{ flex: 1, minWidth: 0 }}>
-                  {/* Title row: project tag + truncated preview */}
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
-                    {session.project && (
-                      <Box
-                        component="span"
-                        sx={{
-                          fontSize: '0.6rem',
-                          fontWeight: 600,
-                          color: 'var(--accent-yellow)',
-                          bgcolor: 'rgba(255, 168, 0, 0.12)',
-                          px: 0.6,
-                          py: 0.05,
-                          borderRadius: 0.5,
-                          flexShrink: 0,
-                          textTransform: 'uppercase',
-                          letterSpacing: 0.3,
-                          maxWidth: 100,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {session.project}
-                      </Box>
-                    )}
-                    {isEditing ? (
-                      <SessionTitleEditor
-                        initialTitle={shownTitle}
-                        onCommit={(value) => void commitRename(session, value, shownTitle)}
-                        onCancel={() => setEditingId(null)}
-                      />
-                    ) : (
-                      <Typography
-                        variant="body2"
-                        onDoubleClick={(e) => startRename(session.id, e)}
-                        sx={{
-                          fontWeight: isSelected ? 600 : 400,
-                          color: 'var(--text)',
-                          fontSize: '0.84rem',
-                          lineHeight: 1.4,
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          flex: 1,
-                          minWidth: 0,
-                        }}
-                      >
-                        {shownTitle}
-                      </Typography>
-                    )}
-                  </Box>
-                  {/* Subtitle row: status · message count · time */}
-                  <Typography
-                    variant="caption"
-                    sx={{
-                      color: 'var(--muted-text)',
-                      fontSize: '0.65rem',
-                      lineHeight: 1.2,
-                    }}
-                  >
-                    {[
-                      session.expired ? 'needs a catch-up' : null,
-                      session.messageCount ? `${session.messageCount} msgs` : null,
-                      formatTime(session.savedAt || session.createdAt),
-                    ].filter(Boolean).join(' · ')}
-                  </Typography>
-                </Box>
-
-                {/* Attention badge — pulsing dot when background session needs approval */}
-                {session.needsAttention && !isSelected && (
-                  <Box
-                    sx={{
-                      width: 8,
-                      height: 8,
-                      borderRadius: '50%',
-                      bgcolor: 'var(--accent-yellow)',
-                      flexShrink: 0,
-                      animation: 'pulse 2s ease-in-out infinite',
-                      '@keyframes pulse': {
-                        '0%, 100%': { opacity: 1, transform: 'scale(1)' },
-                        '50%': { opacity: 0.5, transform: 'scale(0.8)' },
-                      },
-                    }}
-                  />
-                )}
-
-                {!isEditing && (
-                  <IconButton
-                    className="rename-btn"
-                    size="small"
-                    aria-label="Rename chat"
-                    onClick={(e) => startRename(session.id, e)}
-                    sx={{
-                      color: 'var(--muted-text)',
-                      width: 26,
-                      height: 26,
-                      flexShrink: 0,
-                      '&:hover': { color: 'var(--text)', bgcolor: 'var(--hover-bg)' },
-                    }}
-                  >
-                    <EditOutlinedIcon sx={{ fontSize: 15 }} />
-                  </IconButton>
-                )}
-
-                <IconButton
-                  className="delete-btn"
-                  size="small"
-                  onClick={(e) => handleDeleteClick(session.id, e)}
-                  sx={{
-                    color: 'var(--muted-text)',
-                    width: 26,
-                    height: 26,
-                    flexShrink: 0,
-                    '&:hover': { color: 'var(--accent-red)', bgcolor: 'rgba(244,67,54,0.08)' },
-                  }}
-                >
-                  <DeleteOutlineIcon sx={{ fontSize: 15 }} />
-                </IconButton>
-              </Box>
-            );
-          })
+          renderSessionList()
         )}
       </Box>
 
